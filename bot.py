@@ -7,6 +7,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges, ChatMemberUpdated
 from pyrogram.errors import RPCError, FloodWait
 from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, TARGET_BOT_ID
+from database import MongoDB
 
 # Set up logging
 logging.basicConfig(
@@ -273,7 +274,7 @@ async def reset_session(client: Client):
         await client.start()
         logger.info("Session reset successfully")
     except Exception as e:
-        logger.error(f"Failed to reset session: {str(e)}")
+        logger.error("Failed to reset session: {str(e)}")
 
 # Handler for when the bot's chat member status is updated
 @app.on_chat_member_updated()
@@ -834,7 +835,7 @@ async def promote_bot_all(client: Client, message: Message):
                             )
                             invite_cache[chat_id][bot_member.id]["task"] = task
                             errors.append(
-                                f"{chat_title} (ID: {chat_id}): INTERVAL_SERVER_ERROR - Sent invite link to @{bot_username}. "
+                                f"{chat_title} (ID: {chat_id}): Sent invite link to @{bot_username}. "
                                 "Waiting for them to join within 1 minute to promote."
                             )
                             continue
