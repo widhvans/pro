@@ -29,21 +29,29 @@ CHAT_FILE = "chats.json"
 # Helper function to load chat IDs from JSON
 def load_chats():
     if os.path.exists(CHAT_FILE):
-        with open(CHAT_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(CHAT_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load chats.json: {str(e)}")
+            return []
     return []
 
 # Helper function to save chat IDs to JSON
 def save_chats(chats):
-    with open(CHAT_FILE, "w") as f:
-        json.dump(chats, f, indent=4)
+    try:
+        with open(CHAT_FILE, "w") as f:
+            json.dump(chats, f, indent=4)
+        logger.info(f"Saved chats to {CHAT_FILE}: {chats}")
+    except Exception as e:
+        logger.error(f"Failed to save chats.json: {str(e)}")
 
 # Helper function to get the bot's own admin privileges in a chat
 async def get_bot_privileges(client: Client, chat_id: int) -> dict:
     try:
         bot_member = await client.get_chat_member(chat_id, "me")
         if bot_member.status == "administrator":
-            return {
+            privileges = {
                 "can_manage_chat": bot_member.privileges.can_manage_chat,
                 "can_delete_messages": bot_member.privileges.can_delete_messages,
                 "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
@@ -53,6 +61,8 @@ async def get_bot_privileges(client: Client, chat_id: int) -> dict:
                 "can_invite_users": bot_member.privileges.can_invite_users,
                 "can_pin_messages": bot_member.privileges.can_pin_messages,
             }
+            logger.info(f"Bot privileges in {chat_id}: {privileges}")
+            return privileges
         else:
             logger.warning(f"Bot is not an admin in chat {chat_id}")
             return {}
@@ -63,11 +73,14 @@ async def get_bot_privileges(client: Client, chat_id: int) -> dict:
 # Handler to detect when the bot's admin status changes
 @app.on_chat_member_updated()
 async def on_admin_status_updated(client: Client, update: ChatMemberUpdated):
-    if update.new_chat_member and update.new_chat_member.user.id == (await client.get_me()).id:
+    bot = await client.get_me()
+    if update.new_chat_member and update.new_chat_member.user.id == bot.id:
         chat_id = update.chat.id
         chats = load_chats()
         
-        if update.new_chat_member.status == "administrator" and update.new_chat_member.privileges.can_promote_members:
+        logger.info(f"Chat member update for bot in chat {chat_id}: Status={update.new_chat_member.status}, CanPromote={getattr(update.new_chat_member.privileges, 'can_promote_members', False)}")
+        
+        if update.new_chat_member.status == "administrator" and getattr(update.new_chat_member.privileges, "can_promote_members", False):
             if chat_id not in chats:
                 chats.append(chat_id)
                 save_chats(chats)
@@ -76,6 +89,55 @@ async def on_admin_status_updated(client: Client, update: ChatMemberUpdated):
             chats.remove(chat_id)
             save_chats(chats)
             logger.info(f"Bot removed as admin or lost promote permissions in chat {chat_id}")
+
+# Command to check registered chats
+@app.on_message(filters.command("checkchats") & filters.user(ADMIN_ID))
+async def check_chats(client: Client, message: Message):
+    logger.info(f"Received /checkchats command from {message.from_user.id}")
+    chats = load_chats()
+    if chats:
+        chat_list = "\n".join([f"- {chat_id}" for chat_id in chats])
+        await message.reply(f"Registered chats:\n{chat_list}")
+    else:
+        await message.reply("No chats registered. Add me as an admin with 'Add New Admins' permission in groups/channels.")
+    logger.info(f"Checked chats: {chats}")
+
+# Command to manually refresh chat list (for chats added before bot was running)
+@app.on_message(filters.command("refresh") & filters.user(ADMIN_ID))
+async def refresh_chats(client: Client, message: Message):
+    logger.info(f"Received /refresh command from {message.from_user.id}")
+    args = message.text.split()
+    
+    if len(args) < 2:
+        await message.reply("Usage: /refresh <chat_id1> <chat_id2> ...")
+        logger.warning("Invalid /refresh command format")
+        return
+    
+    chats = load_chats()
+    added_count = 0
+    
+    for chat_id in args[1:]:
+        try:
+            chat_id = int(chat_id)
+            privileges = await get_bot_privileges(client, chat_id)
+            if privileges.get("can_promote_members", False):
+                if chat_id not in chats:
+                    chats.append(chat_id)
+                    added_count += 1
+                    logger.info(f"Added chat {chat_id} during refresh")
+            else:
+                if chat_id in chats:
+                    chats.remove(chat_id)
+                    logger.info(f"Removed chat {chat_id} during refresh (no promote permission)")
+        except ValueError:
+            await message.reply(f"Invalid chat_id: {chat_id}")
+            logger.warning(f"Invalid chat_id in /refresh: {chat_id}")
+        except RPCError as e:
+            logger.error(f"Failed to check chat {chat_id} during refresh: {str(e)}")
+    
+    save_chats(chats)
+    await message.reply(f"Refresh complete! Added {added_count} chats. Use /checkchats to view registered chats.")
+    logger.info(f"Refresh completed: Added {added_count} chats")
 
 # Command to promote a bot to admin in a specific chat with same permissions
 @app.on_message(filters.command("promote") & filters.user(ADMIN_ID))
@@ -179,7 +241,9 @@ async def start(client: Client, message: Message):
     await message.reply("Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
                        "Commands:\n"
                        "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
-                       "/promoteall <bot_username> - Promote a bot in all chats where I'm an admin")
+                       "/promoteall <bot_username> - Promote a bot in all chats where I'm an admin\n"
+                       "/checkchats - View registered chats\n"
+                       "/refresh <chat_id1> <chat_id2> ... - Manually refresh chat list")
     logger.info(f"Start command received from {message.from_user.id}")
 
 # Run the bot
