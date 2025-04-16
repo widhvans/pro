@@ -35,7 +35,7 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
             status = bot_member.status.value  # Get string value (e.g., 'administrator')
             logger.info(f"Primary admin check attempt {attempt + 1}/{max_retries} for chat {chat_id}: status={status}")
             if status in ["administrator", "creator"]:
-                return {
+                privileges = {
                     "can_manage_chat": bot_member.privileges.can_manage_chat or False,
                     "can_delete_messages": bot_member.privileges.can_delete_messages or False,
                     "can_manage_video_chats": bot_member.privileges.can_manage_video_chats or False,
@@ -45,14 +45,15 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                     "can_invite_users": bot_member.privileges.can_invite_users or False,
                     "can_pin_messages": bot_member.privileges.can_pin_messages or False,
                 }
+                logger.info(f"Bot is admin in chat {chat_id}: privileges={privileges}")
+                return privileges
             
             # Fallback check using get_chat_administrators
             logger.info(f"Fallback admin check attempt {attempt + 1}/{max_retries} for chat {chat_id}")
             admins = await client.get_chat_administrators(chat_id)
             for admin in admins:
                 if admin.user.id == bot.id:
-                    logger.info(f"Bot found in admins list for chat {chat_id}")
-                    return {
+                    privileges = {
                         "can_manage_chat": admin.privileges.can_manage_chat or False,
                         "can_delete_messages": admin.privileges.can_delete_messages or False,
                         "can_manage_video_chats": admin.privileges.can_manage_video_chats or False,
@@ -62,6 +63,8 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                         "can_invite_users": admin.privileges.can_invite_users or False,
                         "can_pin_messages": admin.privileges.can_pin_messages or False,
                     }
+                    logger.info(f"Bot found in admins list for chat {chat_id}: privileges={privileges}")
+                    return privileges
             logger.warning(f"Bot not found in admins list for chat {chat_id}")
             return {}
         
@@ -294,15 +297,18 @@ async def start(client: Client, message: Message):
                        "/promoteall <bot_username> - Promote a bot in all stored chats")
     logger.info(f"Start command received from {message.from_user.id}")
 
-# Run the bot with periodic task
-async def main():
+# Initialize periodic task after startup
+@app.on_message(filters.command("init") & filters.user(ADMIN_ID))
+async def init(client: Client, message: Message):
     try:
-        await app.start()
-        logger.info("Bot started successfully")
-        asyncio.create_task(check_all_chats_admin_status(app))
-        await app.run()
+        asyncio.create_task(check_all_chats_admin_status(client))
+        await message.reply("Initialized periodic admin status check.")
+        logger.info("Initialized periodic admin status check")
     except Exception as e:
-        logger.error(f"Failed to start bot: {str(e)}")
+        await message.reply(f"Failed to initialize: {str(e)}")
+        logger.error(f"Failed to initialize periodic check: {str(e)}")
 
+# Run the bot
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("Starting Admin Promoter Bot")
+    app.run()
