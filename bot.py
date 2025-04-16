@@ -2,6 +2,7 @@
 import logging
 import asyncio
 import os
+from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges, ChatMemberUpdated
 from pyrogram.errors import RPCError, FloodWait
@@ -24,6 +25,9 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 mongo_db = MongoDB()
+
+# In-memory cache for invite links and pending promotions
+invite_cache = {}  # {chat_id: {user_id: {"link": str, "expires": datetime, "task": asyncio.Task}}}
 
 # Helper function to validate chat accessibility
 async def is_chat_valid(client: Client, chat_id: int) -> bool:
@@ -93,9 +97,9 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                         return {}
                 return privileges
             
-            # Fallback check using get_chat_administrators
+            # Fallback check using get_chat_members with admin filter
             logger.info(f"Fallback admin check attempt {attempt + 1}/{max_retries} for chat {chat_id}")
-            admins = await client.get_chat_administrators(chat_id)
+            admins = await client.get_chat_members(chat_id, filter="administrators")
             for admin in admins:
                 if admin.user.id == bot.id:
                     privileges = {
@@ -211,18 +215,37 @@ async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
         logger.warning(f"Direct invite attempt failed for user {user_id} in chat {chat_id}: {error_msg}")
         if "BOT_METHOD_INVALID" in error_msg or "CHAT_WRITE_FORBIDDEN" in error_msg:
             # Fallback to invite link
-            try:
-                invite_link = await client.export_chat_invite_link(chat_id)
-                await client.send_message(
-                    ADMIN_ID,
-                    f"Couldn't invite user {user_id} directly to chat {chat_id}. "
-                    f"Please have @{user_id} join using this invite link: {invite_link}"
-                )
-                logger.info(f"Generated invite link for user {user_id} to join chat {chat_id}: {invite_link}")
-                return False  # Indicate invite was not completed, but link was sent
-            except RPCError as link_e:
-                logger.error(f"Failed to generate invite link for chat {chat_id}: {str(link_e)}")
-                return False
+            for attempt in range(2):
+                try:
+                    # Create temporary invite link (expires in 5 minutes, 1 user)
+                    expire_date = datetime.utcnow() + timedelta(minutes=5)
+                    invite_link = await client.create_chat_invite_link(
+                        chat_id,
+                        expire_date=expire_date,
+                        member_limit=1
+                    )
+                    invite_link = invite_link.invite_link
+                    # Store in cache for join detection
+                    if chat_id not in invite_cache:
+                        invite_cache[chat_id] = {}
+                    invite_cache[chat_id][user_id] = {
+                        "link": invite_link,
+                        "expires": expire_date,
+                        "task": None  # Will be set in promotion
+                    }
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"Couldn't invite @{user_id} directly to chat {chat_id}. "
+                        f"Please have @{user_id} join using this invite link within 5 minutes: {invite_link}"
+                    )
+                    logger.info(f"Generated invite link for user {user_id} to join chat {chat_id}: {invite_link}")
+                    return False  # Indicate invite was not completed, but link was sent
+                except RPCError as link_e:
+                    logger.error(f"Failed to generate invite link for chat {chat_id}, attempt {attempt + 1}/2: {str(link_e)}")
+                    if attempt < 1:
+                        await asyncio.sleep(2)
+                    else:
+                        return False
         else:
             logger.error(f"Failed to invite user {user_id} to chat {chat_id}: {error_msg}")
             return False
@@ -251,11 +274,12 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
     logger.info(f"Chat member update: chat_id={chat.id}, user_id={new_member.user.id if new_member else None}, status={new_member.status.value if new_member else None}")
     
     bot = await client.get_me()
+    chat_id = chat.id
+    chat_title = chat.title or str(chat_id)
+    chat_type = chat.type.value
+    
+    # Handle bot's own status update
     if new_member and new_member.user.id == bot.id and new_member.status.value in ["member", "administrator", "creator"]:
-        chat_type = chat.type.value
-        chat_id = chat.id
-        chat_title = chat.title or str(chat_id)
-        
         if chat_type in ["group", "supergroup", "channel"]:
             privileges = await is_bot_admin(client, chat_id)
             if privileges:
@@ -288,6 +312,41 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                     logger.error(f"Failed to notify ADMIN_ID for chat {chat_id}: {str(e)}")
         else:
             logger.info(f"Ignored chat {chat_id}: type {chat_type} is not group/supergroup/channel")
+    
+    # Handle target bot joining via invite link
+    if new_member and chat_id in invite_cache and new_member.user.id in invite_cache[chat_id]:
+        user_id = new_member.user.id
+        if new_member.status.value in ["member", "administrator"]:
+            logger.info(f"Detected user {user_id} joined chat {chat_id} via invite link")
+            # Cancel any timeout task
+            cache_entry = invite_cache[chat_id][user_id]
+            if cache_entry["task"]:
+                cache_entry["task"].cancel()
+            
+            # Attempt promotion
+            try:
+                privileges = await is_bot_admin(client, chat_id)
+                if not privileges:
+                    logger.warning(f"Cannot promote user {user_id} in chat {chat_id}: Bot lacks admin permissions")
+                    return
+                
+                await client.promote_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    privileges=ChatPrivileges(**privileges)
+                )
+                await client.send_message(
+                    ADMIN_ID,
+                    f"Successfully promoted @{user_id} to admin in {chat_type} {chat_title} (ID: {chat_id}) after joining via invite link"
+                )
+                logger.info(f"Promoted user {user_id} in chat {chat_id} after joining")
+            except Exception as e:
+                logger.error(f"Failed to promote user {user_id} in chat {chat_id} after joining: {str(e)}")
+            finally:
+                # Clean up cache
+                del invite_cache[chat_id][user_id]
+                if not invite_cache[chat_id]:
+                    del invite_cache[chat_id]
 
 # Periodic task to check admin status in all chats
 async def check_all_chats_admin_status(client: Client):
@@ -378,6 +437,31 @@ async def clean_db(client: Client, message: Message):
         logger.error(f"Unexpected error in /cleandb: {str(e)}")
 
 # Command to promote a bot to admin in a specific chat with same permissions
+async def promote_with_timeout(client: Client, chat_id: int, user_id: int, bot_username: str, timeout: int = 300):
+    """Wait for user to join and promote, with timeout."""
+    start_time = datetime.utcnow()
+    while datetime.utcnow() - start_time < timedelta(seconds=timeout):
+        status = await get_user_status(client, chat_id, user_id)
+        if status in ["member", "administrator"]:
+            try:
+                privileges = await is_bot_admin(client, chat_id)
+                if not privileges:
+                    logger.warning(f"Cannot promote user {user_id} in chat {chat_id}: Bot lacks admin permissions")
+                    return False
+                await client.promote_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    privileges=ChatPrivileges(**privileges)
+                )
+                logger.info(f"Promoted @{bot_username} in chat {chat_id} after joining")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to promote user {user_id} in chat {chat_id}: {str(e)}")
+                return False
+        await asyncio.sleep(5)  # Check every 5 seconds
+    logger.warning(f"Timeout waiting for user {user_id} to join chat {chat_id}")
+    return False
+
 @app.on_message(filters.command("promote") & filters.user(ADMIN_ID))
 async def promote_bot(client: Client, message: Message):
     logger.info(f"Received /promote command from {message.from_user.id}")
@@ -423,6 +507,17 @@ async def promote_bot(client: Client, message: Message):
                 await asyncio.sleep(2)
                 logger.info(f"Invited @{bot_username} to chat {chat_id} after unban")
             else:
+                # If invite failed, rely on cache and timeout
+                if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                    task = asyncio.create_task(
+                        promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                    )
+                    invite_cache[chat_id][bot_member.id]["task"] = task
+                    await message.reply(
+                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
+                        "Waiting for them to join within 5 minutes to promote."
+                    )
+                    return
                 await message.reply(
                     f"Failed to invite @{bot_username} to chat {chat_id} after unbanning. "
                     "Please add them manually or ensure I have 'Invite Users via Link' permission."
@@ -435,6 +530,17 @@ async def promote_bot(client: Client, message: Message):
                 await asyncio.sleep(2)
                 logger.info(f"Invited @{bot_username} to chat {chat_id}")
             else:
+                # If invite failed, rely on cache and timeout
+                if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                    task = asyncio.create_task(
+                        promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                    )
+                    invite_cache[chat_id][bot_member.id]["task"] = task
+                    await message.reply(
+                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
+                        "Waiting for them to join within 5 minutes to promote."
+                    )
+                    return
                 await message.reply(
                     f"Failed to invite @{bot_username} to chat {chat_id}. "
                     "Please add them manually or ensure I have 'Invite Users via Link' permission."
@@ -502,6 +608,17 @@ async def promote_bot(client: Client, message: Message):
                 await message.reply(f"Invited @{bot_username} to chat {chat_id}. Please retry the promotion.")
                 logger.info(f"Invited @{bot_username} to chat {chat_id} after USER_NOT_PARTICIPANT")
             else:
+                # If invite failed, rely on cache and timeout
+                if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                    task = asyncio.create_task(
+                        promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                    )
+                    invite_cache[chat_id][bot_member.id]["task"] = task
+                    await message.reply(
+                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
+                        "Waiting for them to join within 5 minutes to promote."
+                    )
+                    return
                 await message.reply(
                     f"@{bot_username} is not a member of chat {chat_id}, and I couldn't invite them. "
                     "Please add them manually or check my permissions."
@@ -572,6 +689,17 @@ async def promote_bot_all(client: Client, message: Message):
                         await asyncio.sleep(2)
                         logger.info(f"Invited @{bot_username} to chat {chat_id} after unban")
                     else:
+                        # If invite failed, rely on cache and timeout
+                        if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                            task = asyncio.create_task(
+                                promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                            )
+                            invite_cache[chat_id][bot_member.id]["task"] = task
+                            errors.append(
+                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
+                                "Waiting for them to join within 5 minutes to promote."
+                            )
+                            continue
                         failure_count += 1
                         errors.append(
                             f"{chat_title} (ID: {chat_id}): Failed to invite @{bot_username} after unbanning. "
@@ -585,6 +713,17 @@ async def promote_bot_all(client: Client, message: Message):
                         await asyncio.sleep(2)
                         logger.info(f"Invited @{bot_username} to chat {chat_id}")
                     else:
+                        # If invite failed, rely on cache and timeout
+                        if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                            task = asyncio.create_task(
+                                promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                            )
+                            invite_cache[chat_id][bot_member.id]["task"] = task
+                            errors.append(
+                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
+                                "Waiting for them to join within 5 minutes to promote."
+                            )
+                            continue
                         failure_count += 1
                         errors.append(
                             f"{chat_title} (ID: {chat_id}): Failed to invite @{bot_username}. "
@@ -654,6 +793,17 @@ async def promote_bot_all(client: Client, message: Message):
                         errors.append(f"{chat_title} (ID: {chat_id}): Invited @{bot_username}, please retry.")
                         logger.info(f"Invited @{bot_username} to chat {chat_id} after USER_NOT_PARTICIPANT")
                     else:
+                        # If invite failed, rely on cache and timeout
+                        if chat_id in invite_cache and bot_member.id in invite_cache[chat_id]:
+                            task = asyncio.create_task(
+                                promote_with_timeout(client, chat_id, bot_member.id, bot_username)
+                            )
+                            invite_cache[chat_id][bot_member.id]["task"] = task
+                            errors.append(
+                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
+                                "Waiting for them to join within 5 minutes to promote."
+                            )
+                            continue
                         errors.append(
                             f"{chat_title} (ID: {chat_id}): @{bot_username} not a member and couldn't be invited. "
                             "Please add them manually."
