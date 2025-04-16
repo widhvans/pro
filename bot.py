@@ -60,9 +60,6 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                 if not privileges["can_promote_members"]:
                     logger.warning(f"Bot lacks 'can_promote_members' permission in chat {chat_id}")
                     return {}
-                if not privileges["can_invite_users"]:
-                    logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
-                    return {}
                 
                 # Test actual promotion capability with ADMIN_ID
                 chat = await client.get_chat(chat_id)
@@ -114,9 +111,6 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                     logger.info(f"Bot found in admins list for chat {chat_id}: privileges={privileges}")
                     if not privileges["can_promote_members"]:
                         logger.warning(f"Bot lacks 'can_promote_members' permission in chat {chat_id}")
-                        return {}
-                    if not privileges["can_invite_users"]:
-                        logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
                         return {}
                     if chat.type in ["supergroup", "channel"]:
                         try:
@@ -177,27 +171,61 @@ async def get_user_status(client: Client, chat_id: int, user_id: int) -> str:
         return None
 
 # Helper function to unban a user/bot from the chat
-async def unban_user(client: Client, chat_id: int, user_id: int) -> bool:
-    try:
-        await client.unban_chat_member(chat_id, user_id)
-        logger.info(f"Successfully unbanned user {user_id} from chat {chat_id}")
-        return True
-    except RPCError as e:
-        logger.error(f"Failed to unban user {user_id} from chat {chat_id}: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error unbanning user {user_id} from chat {chat_id}: {str(e)}")
-        return False
+async def unban_user(client: Client, chat_id: int, user_id: int, max_retries: int = 2) -> bool:
+    for attempt in range(max_retries):
+        try:
+            await client.unban_chat_member(chat_id, user_id)
+            logger.info(f"Successfully unbanned user {user_id} from chat {chat_id}")
+            return True
+        except RPCError as e:
+            logger.error(f"Failed to unban user {user_id} from chat {chat_id}, attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Unexpected error unbanning user {user_id} from chat {chat_id}: {str(e)}")
+            return False
+    return False
 
 # Helper function to invite a user/bot to the chat
 async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
     try:
-        await client.add_chat_members(chat_id, [user_id])
-        logger.info(f"Successfully invited user {user_id} to chat {chat_id}")
-        return True
+        chat = await client.get_chat(chat_id)
+        if chat.type in ["supergroup", "channel"]:
+            try:
+                # Try direct invite
+                await client.add_chat_members(chat_id, [user_id])
+                logger.info(f"Successfully invited user {user_id} to chat {chat_id} via direct invite")
+                return True
+            except RPCError as e:
+                error_msg = str(e)
+                if "BOT_METHOD_INVALID" in error_msg or "USER_ALREADY_PARTICIPANT" in error_msg:
+                    logger.warning(f"Direct invite failed for user {user_id} in chat {chat_id}: {error_msg}")
+                else:
+                    raise
+        else:
+            await client.add_chat_members(chat_id, [user_id])
+            logger.info(f"Successfully invited user {user_id} to chat {chat_id} via direct invite")
+            return True
     except RPCError as e:
-        logger.error(f"Failed to invite user {user_id} to chat {chat_id}: {str(e)}")
-        return False
+        error_msg = str(e)
+        logger.warning(f"Direct invite attempt failed for user {user_id} in chat {chat_id}: {error_msg}")
+        if "BOT_METHOD_INVALID" in error_msg or "CHAT_WRITE_FORBIDDEN" in error_msg:
+            # Fallback to invite link
+            try:
+                invite_link = await client.export_chat_invite_link(chat_id)
+                await client.send_message(
+                    ADMIN_ID,
+                    f"Couldn't invite user {user_id} directly to chat {chat_id}. "
+                    f"Please have @{user_id} join using this invite link: {invite_link}"
+                )
+                logger.info(f"Generated invite link for user {user_id} to join chat {chat_id}: {invite_link}")
+                return False  # Indicate invite was not completed, but link was sent
+            except RPCError as link_e:
+                logger.error(f"Failed to generate invite link for chat {chat_id}: {str(link_e)}")
+                return False
+        else:
+            logger.error(f"Failed to invite user {user_id} to chat {chat_id}: {error_msg}")
+            return False
     except Exception as e:
         logger.error(f"Unexpected error inviting user {user_id} to chat {chat_id}: {str(e)}")
         return False
@@ -253,7 +281,7 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                     await client.send_message(
                         ADMIN_ID,
                         f"Bot added to {chat_type} {chat_title} (ID: {chat_id}) but lacks required permissions. "
-                        "Please grant 'Invite Users via Link' and 'Add New Admins' permissions in chat settings."
+                        "Please grant 'Invite Users via Link', 'Ban Members', and 'Add New Admins' permissions in chat settings."
                     )
                     logger.info(f"Bot not an admin in {chat_id}, requested permissions")
                 except Exception as e:
@@ -300,7 +328,7 @@ async def add_chat(client: Client, message: Message):
         privileges = await is_bot_admin(client, chat_id)
         if not privileges:
             await message.reply(
-                "I must be an admin with 'Invite Users via Link' and 'Add New Admins' permissions to add this chat. "
+                "I must be an admin with 'Invite Users via Link', 'Ban Members', and 'Add New Admins' permissions to add this chat. "
                 "Please check chat settings > Administrators."
             )
             logger.warning(f"Bot is not an admin or lacks required permissions in chat {chat_id}")
@@ -382,7 +410,7 @@ async def promote_bot(client: Client, message: Message):
             # Try unbanning
             if await unban_user(client, chat_id, bot_member.id):
                 logger.info(f"Unbanned @{bot_username} in chat {chat_id}")
-                await asyncio.sleep(2)  # Wait for unban to process
+                await asyncio.sleep(2)
             else:
                 await message.reply(
                     f"@{bot_username} is banned from chat {chat_id}, and I couldn't unban them. "
@@ -419,7 +447,7 @@ async def promote_bot(client: Client, message: Message):
         if not privileges:
             await message.reply(
                 "I am not an admin or lack required permissions in this chat. "
-                "Please ensure I have 'Invite Users via Link' and 'Add New Admins' permissions in chat settings > Administrators. "
+                "Please ensure I have 'Invite Users via Link', 'Ban Members', and 'Add New Admins' permissions in chat settings > Administrators. "
                 "If the issue persists, try granting full admin rights."
             )
             logger.warning(f"Bot is not an admin or lacks permissions in chat {chat_id} for /promote")
@@ -448,7 +476,7 @@ async def promote_bot(client: Client, message: Message):
                     raise
         await message.reply(
             "Failed to promote: I need the 'Invite Users via Link' permission. "
-            "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link' and 'Add New Admins'. "
+            "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link', 'Ban Members', and 'Add New Admins'. "
             "If this persists, grant full admin rights to the bot."
         )
         logger.error(f"Promotion failed in {chat_id}: Missing required permissions")
@@ -464,7 +492,7 @@ async def promote_bot(client: Client, message: Message):
         elif "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
             await message.reply(
                 "Failed to promote: I need the 'Invite Users via Link' permission. "
-                "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link' and 'Add New Admins'. "
+                "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link', 'Ban Members', and 'Add New Admins'. "
                 "If this persists, grant full admin rights to the bot."
             )
             logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
@@ -570,7 +598,7 @@ async def promote_bot_all(client: Client, message: Message):
                 if not privileges:
                     failure_count += 1
                     errors.append(
-                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link' or 'Add New Admins' permissions. "
+                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link', 'Ban Members', or 'Add New Admins' permissions. "
                         "Try granting full admin rights."
                     )
                     logger.warning(f"Bot lacks permissions in chat {chat_id}")
