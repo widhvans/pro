@@ -29,14 +29,18 @@ class MongoDB:
                 upsert=True
             )
             logger.info(f"Saved chat {chat_id} ({chat_title}) to MongoDB")
+            return True
         except Exception as e:
             logger.error(f"Failed to save chat {chat_id}: {str(e)}")
+            return False
 
     def get_all_chats(self):
         """Retrieve all stored chats."""
         try:
             collection = self.db.chats
-            return list(collection.find())
+            chats = list(collection.find())
+            logger.info(f"Retrieved {len(chats)} chats from MongoDB")
+            return chats
         except Exception as e:
             logger.error(f"Failed to retrieve chats: {str(e)}")
             return []
