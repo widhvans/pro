@@ -48,7 +48,7 @@ async def get_bot_privileges(client: Client, chat_id: int) -> dict:
 # Handler for when the bot's chat member status is updated
 @app.on_chat_member_updated()
 async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
-    logger.info(f"Chat member update received: chat_id={update.chat.id}, user_id={update.new_chat_member.user.id if update.new_chat_member else None}")
+    logger.info(f"Chat member update: chat_id={update.chat.id}, user_id={update.new_chat_member.user.id if update.new_chat_member else None}, status={update.new_chat_member.status if update.new_chat_member else None}")
     chat = update.chat
     new_member = update.new_chat_member
     bot = await client.get_me()
@@ -71,40 +71,38 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                 )
                 logger.error(f"Failed to save chat {chat_id} to database")
 
-# Command to manually add a chat to the database
-@app.on_message(filters.command("addchat") & filters.user(ADMIN_ID))
+# Command to manually add the current chat to the database
+@app.on_message(filters.command("addchat") & filters.user(ADMIN_ID) & (filters.group | filters.channel))
 async def add_chat(client: Client, message: Message):
-    logger.info(f"Received /addchat command from {message.from_user.id}")
-    args = message.text.split()
-    
-    if len(args) != 2:
-        await message.reply("Usage: /addchat <chat_id>")
-        logger.warning("Invalid /addchat command format")
-        return
+    logger.info(f"Received /addchat command from {message.from_user.id} in chat {message.chat.id}")
+    chat = message.chat
+    chat_id = chat.id
+    chat_type = chat.type.value  # Get string value (e.g., 'supergroup')
+    chat_title = chat.title or str(chat_id)
     
     try:
-        chat_id = int(args[1])
-        chat = await client.get_chat(chat_id)
-        chat_type = chat.type
-        chat_title = chat.title or str(chat_id)
+        # Check if bot is an admin
+        bot_member = await client.get_chat_member(chat_id, "me")
+        if bot_member.status != "administrator":
+            await message.reply("I must be an admin to add this chat.")
+            logger.warning(f"Bot is not an admin in chat {chat_id}")
+            return
         
+        # Save chat to database
         if chat_type in ["group", "supergroup", "channel"]:
             if mongo_db.save_chat(chat_id, chat_type, chat_title):
                 await message.reply(f"Successfully saved {chat_title} (ID: {chat_id}) to database")
-                logger.info(f"Manually saved chat {chat_id} ({chat_title}) to database")
+                logger.info(f"Saved chat {chat_id} ({chat_title}, type: {chat_type}) to database")
             else:
                 await message.reply(f"Failed to save {chat_title} (ID: {chat_id}) to database")
-                logger.error(f"Failed to manually save chat {chat_id} to database")
+                logger.error(f"Failed to save chat {chat_id} to database")
         else:
-            await message.reply("Chat must be a group, supergroup, or channel")
+            await message.reply("This command can only be used in groups, supergroups, or channels.")
             logger.warning(f"Invalid chat type {chat_type} for chat {chat_id}")
             
-    except ValueError:
-        await message.reply("Invalid chat_id format. Use a numeric ID (e.g., -100123456789)")
-        logger.error("Invalid chat_id format in /addchat")
     except RPCError as e:
         await message.reply(f"Error: {str(e)}")
-        logger.error(f"Failed to get chat {chat_id}: {str(e)}")
+        logger.error(f"Failed to process /addchat in {chat_id}: {str(e)}")
     except Exception as e:
         await message.reply("An unexpected error occurred. Check logs for details.")
         logger.error(f"Unexpected error in /addchat: {str(e)}")
@@ -170,7 +168,7 @@ async def promote_bot_all(client: Client, message: Message):
         # Retrieve chats from MongoDB
         chats = mongo_db.get_all_chats()
         if not chats:
-            await message.reply("No chats found in the database. Use /addchat to add chats.")
+            await message.reply("No chats found in the database. Use /addchat in a group or channel to add chats.")
             logger.warning("No chats found in MongoDB")
             return
         
@@ -212,7 +210,7 @@ async def promote_bot_all(client: Client, message: Message):
 async def start(client: Client, message: Message):
     await message.reply("Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
                        "Commands:\n"
-                       "/addchat <chat_id> - Add a chat to the database\n"
+                       "/addchat - Add the current chat to the database (use in group/channel)\n"
                        "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
                        "/promoteall <bot_username> - Promote a bot in all stored chats")
     logger.info(f"Start command received from {message.from_user.id}")
