@@ -2,6 +2,7 @@
 import logging
 import json
 import os
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import RPCError
@@ -46,29 +47,60 @@ def save_chats(chats):
     except Exception as e:
         logger.error(f"Failed to save chats.json: {str(e)}")
 
-# Helper function to get the bot's own admin privileges in a chat
-async def get_bot_privileges(client: Client, chat_id: int) -> dict:
+# Helper function to get the bot's own admin privileges in a chat with retries
+async def get_bot_privileges(client: Client, chat_id: int, retries=3, delay=2) -> dict:
+    for attempt in range(1, retries + 1):
+        try:
+            bot_member = await client.get_chat_member(chat_id, "me")
+            logger.info(f"get_chat_member response for {chat_id}: status={bot_member.status}, privileges={getattr(bot_member, 'privileges', None)}")
+            if bot_member.status == "administrator":
+                privileges = {
+                    "can_manage_chat": bot_member.privileges.can_manage_chat,
+                    "can_delete_messages": bot_member.privileges.can_delete_messages,
+                    "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
+                    "can_restrict_members": bot_member.privileges.can_restrict_members,
+                    "can_promote_members": bot_member.privileges.can_promote_members,
+                    "can_change_info": bot_member.privileges.can_change_info,
+                    "can_invite_users": bot_member.privileges.can_invite_users,
+                    "can_pin_messages": bot_member.privileges.can_pin_messages,
+                }
+                logger.info(f"Bot privileges in {chat_id}: {privileges}")
+                return privileges
+            else:
+                logger.warning(f"Bot is not an admin in chat {chat_id}: status={bot_member.status}")
+                return {}
+        except RPCError as e:
+            logger.error(f"Attempt {attempt}/{retries} - Failed to get bot privileges in {chat_id}: {str(e)}")
+            if attempt < retries:
+                await asyncio.sleep(delay)
+            continue
+    logger.error(f"Failed to get bot privileges in {chat_id} after {retries} attempts")
+    return {}
+
+# Command to verify bot's admin status in the current chat
+@app.on_message(filters.command("verifyadmin") & filters.user(ADMIN_ID) & (filters.group | filters.channel))
+async def verify_admin(client: Client, message: Message):
+    logger.info(f"Received /verifyadmin command from {message.from_user.id} in chat {message.chat.id}")
+    chat_id = message.chat.id
+    
     try:
-        bot_member = await client.get_chat_member(chat_id, "me")
-        if bot_member.status == "administrator":
-            privileges = {
-                "can_manage_chat": bot_member.privileges.can_manage_chat,
-                "can_delete_messages": bot_member.privileges.can_delete_messages,
-                "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
-                "can_restrict_members": bot_member.privileges.can_restrict_members,
-                "can_promote_members": bot_member.privileges.can_promote_members,
-                "can_change_info": bot_member.privileges.can_change_info,
-                "can_invite_users": bot_member.privileges.can_invite_users,
-                "can_pin_messages": bot_member.privileges.can_pin_messages,
-            }
-            logger.info(f"Bot privileges in {chat_id}: {privileges}")
-            return privileges
+        privileges = await get_bot_privileges(client, chat_id)
+        if privileges:
+            if privileges.get("can_promote_members", False):
+                await message.reply("I am an admin with 'Add New Admins' permission in this chat.")
+                logger.info(f"Bot confirmed as admin with promote permission in {chat_id}")
+            else:
+                await message.reply("I am an admin but lack 'Add New Admins' permission in this chat.")
+                logger.info(f"Bot is admin but lacks promote permission in {chat_id}")
         else:
-            logger.warning(f"Bot is not an admin in chat {chat_id}")
-            return {}
+            await message.reply("I am not an admin in this chat.")
+            logger.info(f"Bot is not an admin in {chat_id}")
     except RPCError as e:
-        logger.error(f"Failed to get bot privileges in {chat_id}: {str(e)}")
-        return {}
+        await message.reply(f"Error checking admin status: {str(e)}")
+        logger.error(f"Failed to verify admin status in {chat_id}: {str(e)}")
+    except Exception as e:
+        await message.reply("An unexpected error occurred. Check logs for details.")
+        logger.error(f"Unexpected error in /verifyadmin: {str(e)}")
 
 # Command to add the current chat (run in group/channel)
 @app.on_message(filters.command("addchat") & filters.user(ADMIN_ID) & (filters.group | filters.channel))
@@ -86,7 +118,7 @@ async def add_chat(client: Client, message: Message):
                 await message.reply(f"Added chat {chat_id} to the list.")
                 logger.info(f"Added chat {chat_id}")
             else:
-                await message.reply("I am not an admin with 'Add New Admins' permission in this chat.")
+                await message.reply("I am not an admin with 'Add New Admins' permission in this chat. Please grant the permission and try again.")
                 logger.warning(f"Bot lacks promote permission in chat {chat_id}")
         else:
             await message.reply(f"Chat {chat_id} is already in the list.")
@@ -150,7 +182,12 @@ async def promote_bot(client: Client, message: Message):
         return
     
     bot_username = args[1]
-    chat_id = args[2]
+    try:
+        chat_id = int(args[2])
+    except ValueError:
+        await message.reply("Invalid chat_id format. Please provide a numeric chat ID (e.g., -100123456789).")
+        logger.warning(f"Invalid chat_id format: {args[2]}")
+        return
     
     try:
         # Check if the bot is a member of the chat
@@ -240,6 +277,7 @@ async def start(client: Client, message: Message):
     await message.reply("Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
                        "Commands:\n"
                        "/addchat - Add the current group/channel (run in chat)\n"
+                       "/verifyadmin - Check if I'm an admin in the current chat\n"
                        "/refresh - Refresh the chat list\n"
                        "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
                        "/promoteall <bot_username> - Promote a bot in all registered chats\n"
