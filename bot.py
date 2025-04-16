@@ -46,13 +46,30 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                     "can_pin_messages": bot_member.privileges.can_pin_messages or False,
                 }
                 logger.info(f"Bot is admin in chat {chat_id}: privileges={privileges}")
-                # Verify required permissions for promotion
+                # Verify required permissions
                 if not privileges["can_promote_members"]:
                     logger.warning(f"Bot lacks 'can_promote_members' permission in chat {chat_id}")
                     return {}
                 if not privileges["can_invite_users"]:
                     logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
                     return {}
+                # Test promotion capability
+                chat = await client.get_chat(chat_id)
+                if chat.type in ["supergroup", "channel"]:
+                    try:
+                        # Attempt a no-op promotion to verify rights
+                        await client.promote_chat_member(
+                            chat_id=chat_id,
+                            user_id=bot.id,
+                            privileges=ChatPrivileges(**privileges)
+                        )
+                        logger.info(f"Test promotion succeeded in chat {chat_id}")
+                    except RPCError as e:
+                        if "CHAT_ADMIN_INVITE_REQUIRED" in str(e):
+                            logger.warning(f"Test promotion failed in chat {chat_id}: Missing 'Invite Users' permission")
+                            return {}
+                        logger.error(f"Test promotion failed in chat {chat_id}: {str(e)}")
+                        return {}
                 return privileges
             
             # Fallback check using get_chat_administrators
@@ -77,6 +94,21 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                     if not privileges["can_invite_users"]:
                         logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
                         return {}
+                    # Test promotion capability
+                    if chat.type in ["supergroup", "channel"]:
+                        try:
+                            await client.promote_chat_member(
+                                chat_id=chat_id,
+                                user_id=bot.id,
+                                privileges=ChatPrivileges(**privileges)
+                            )
+                            logger.info(f"Test promotion succeeded in chat {chat_id}")
+                        except RPCError as e:
+                            if "CHAT_ADMIN_INVITE_REQUIRED" in str(e):
+                                logger.warning(f"Test promotion failed in chat {chat_id}: Missing 'Invite Users' permission")
+                                return {}
+                            logger.error(f"Test promotion failed in chat {chat_id}: {str(e)}")
+                            return {}
                     return privileges
             logger.warning(f"Bot not found in admins list for chat {chat_id}")
             return {}
@@ -157,7 +189,8 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                 try:
                     await client.send_message(
                         ADMIN_ID,
-                        f"Bot added to {chat_type} {chat_title} (ID: {chat_id}) but lacks admin permissions. Please grant 'Invite Users' and 'Add New Admins' permissions."
+                        f"Bot added to {chat_type} {chat_title} (ID: {chat_id}) but lacks required permissions. "
+                        "Please grant 'Invite Users via Link' and 'Add New Admins' permissions in chat settings."
                     )
                     logger.info(f"Bot not an admin in {chat_id}, requested permissions")
                 except Exception as e:
@@ -198,7 +231,10 @@ async def add_chat(client: Client, message: Message):
     try:
         privileges = await is_bot_admin(client, chat_id)
         if not privileges:
-            await message.reply("I must be an admin with 'Invite Users' and 'Add New Admins' permissions to add this chat.")
+            await message.reply(
+                "I must be an admin with 'Invite Users via Link' and 'Add New Admins' permissions to add this chat. "
+                "Please check chat settings > Administrators."
+            )
             logger.warning(f"Bot is not an admin or lacks required permissions in chat {chat_id}")
             return
         
@@ -250,33 +286,51 @@ async def promote_bot(client: Client, message: Message):
             logger.warning(f"{bot_username} not in chat {chat_id}")
             return
         
-        # Check admin status
+        # Check admin status with fresh data
         privileges = await is_bot_admin(client, chat_id)
         if not privileges:
             await message.reply(
                 "I am not an admin or lack required permissions in this chat. "
-                "Please ensure I have 'Invite Users' and 'Add New Admins' permissions."
+                "Please ensure I have 'Invite Users via Link' and 'Add New Admins' permissions in chat settings > Administrators."
             )
             logger.warning(f"Bot is not an admin or lacks permissions in chat {chat_id} for /promote")
             return
         
-        # Promote the bot
-        await client.promote_chat_member(
-            chat_id=chat_id,
-            user_id=bot_member.id,
-            privileges=ChatPrivileges(**privileges)
+        # Attempt promotion with retry on permission error
+        for attempt in range(2):
+            try:
+                await client.promote_chat_member(
+                    chat_id=chat_id,
+                    user_id=bot_member.id,
+                    privileges=ChatPrivileges(**privileges)
+                )
+                await message.reply(f"Successfully promoted {bot_username} to admin in {chat.title or chat.id} with same permissions")
+                logger.info(f"Promoted {bot_username} in chat {chat_id} with same permissions")
+                return
+            except RPCError as e:
+                error_msg = str(e)
+                if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg and attempt == 0:
+                    logger.warning(f"Promotion failed in {chat_id}: CHAT_ADMIN_INVITE_REQUIRED, retrying after refresh")
+                    await asyncio.sleep(2)  # Wait before retry
+                    privileges = await is_bot_admin(client, chat_id)  # Refresh privileges
+                    if not privileges:
+                        break
+                else:
+                    raise
+        await message.reply(
+            "Failed to promote: I need the 'Invite Users via Link' permission. "
+            "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link' and 'Add New Admins'."
         )
-        await message.reply(f"Successfully promoted {bot_username} to admin in {chat.title or chat.id} with same permissions")
-        logger.info(f"Promoted {bot_username} in chat {chat_id} with same permissions")
+        logger.error(f"Promotion failed in {chat_id}: Missing required permissions")
         
     except RPCError as e:
         error_msg = str(e)
         if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
             await message.reply(
-                "Failed to promote: I need the 'Invite Users' permission. "
-                "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users'."
+                "Failed to promote: I need the 'Invite Users via Link' permission. "
+                "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link' and 'Add New Admins'."
             )
-            logger.error(f"Promotion failed due to missing 'Invite Users' permission in {chat_id}")
+            logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
         elif "USER_NOT_PARTICIPANT" in error_msg:
             await message.reply(f"{bot_username} is not a member of {chat.title or chat.id}. Please add them first.")
             logger.error(f"Promotion failed: {bot_username} not in chat {chat_id}")
@@ -322,30 +376,51 @@ async def promote_bot_all(client: Client, message: Message):
                     logger.warning(f"{bot_username} not in chat {chat_id}")
                     continue
                 
-                # Check admin status
+                # Check admin status with fresh data
                 privileges = await is_bot_admin(client, chat_id)
                 if not privileges:
                     failure_count += 1
                     errors.append(
-                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users' or 'Add New Admins' permissions"
+                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link' or 'Add New Admins' permissions"
                     )
                     logger.warning(f"Bot lacks permissions in chat {chat_id}")
                     continue
                 
-                # Promote the bot
-                await client.promote_chat_member(
-                    chat_id=chat_id,
-                    user_id=bot_member.id,
-                    privileges=ChatPrivileges(**privileges)
-                )
-                success_count += 1
-                logger.info(f"Promoted {bot_username} in chat {chat_id} ({chat_title}) with same permissions")
+                # Attempt promotion with retry
+                for attempt in range(2):
+                    try:
+                        await client.promote_chat_member(
+                            chat_id=chat_id,
+                            user_id=bot_member.id,
+                            privileges=ChatPrivileges(**privileges)
+                        )
+                        success_count += 1
+                        logger.info(f"Promoted {bot_username} in chat {chat_id} ({chat_title}) with same permissions")
+                        break
+                    except RPCError as e:
+                        error_msg = str(e)
+                        if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg and attempt == 0:
+                            logger.warning(f"Promotion failed in {chat_id}: CHAT_ADMIN_INVITE_REQUIRED, retrying after refresh")
+                            await asyncio.sleep(2)
+                            privileges = await is_bot_admin(client, chat_id)
+                            if not privileges:
+                                break
+                        else:
+                            raise
+                else:
+                    failure_count += 1
+                    errors.append(
+                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link' permission. "
+                        "Enable it in chat settings > Administrators."
+                    )
+                    logger.error(f"Promotion failed in {chat_id}: Missing required permissions")
+            
             except RPCError as e:
                 failure_count += 1
                 error_msg = str(e)
                 if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
                     errors.append(
-                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users' permission. "
+                        f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link' permission. "
                         "Enable it in chat settings > Administrators."
                     )
                     logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
@@ -362,7 +437,7 @@ async def promote_bot_all(client: Client, message: Message):
         
         reply = f"Promotion complete!\nSuccessfully promoted {bot_username} in {success_count} chats.\nFailed in {failure_count} chats."
         if errors:
-            reply += "\n\nErrors:\n" + "\n".join([f"- {e}" for e in errors[:5]])  # Limit to 5 errors for brevity
+            reply += "\n\nErrors:\n" + "\n".join([f"- {e}" for e in errors[:5]])  # Limit to 5 errors
             if len(errors) > 5:
                 reply += f"\n...and {len(errors) - 5} more (check logs)."
         await message.reply(reply)
