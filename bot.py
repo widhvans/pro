@@ -65,7 +65,7 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                 chat = await client.get_chat(chat_id)
                 if chat.type in ["supergroup", "channel"]:
                     try:
-                        test_privileges = ChatPrivileges(can_manage_chat=True)  # Minimal privilege for test
+                        test_privileges = ChatPrivileges(can_manage_chat=True)
                         await client.promote_chat_member(
                             chat_id=chat_id,
                             user_id=ADMIN_ID,
@@ -159,14 +159,28 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
     logger.error(f"Failed to verify bot admin status in chat {chat_id} after {max_retries} attempts")
     return {}
 
-# Helper function to check if a user/bot is in the chat
-async def is_user_in_chat(client: Client, chat_id: int, user_id: int) -> bool:
+# Helper function to check if a user/bot is in the chat and their status
+async def get_user_status(client: Client, chat_id: int, user_id: int) -> str:
     try:
-        await client.get_chat_member(chat_id, user_id)
-        logger.info(f"User {user_id} is in chat {chat_id}")
-        return True
+        member = await client.get_chat_member(chat_id, user_id)
+        status = member.status.value
+        logger.info(f"User {user_id} is in chat {chat_id} with status: {status}")
+        return status
     except RPCError as e:
         logger.warning(f"User {user_id} not in chat {chat_id}: {str(e)}")
+        return None
+
+# Helper function to invite a user/bot to the chat
+async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
+    try:
+        await client.invite_chat_members(chat_id, [user_id])
+        logger.info(f"Successfully invited user {user_id} to chat {chat_id}")
+        return True
+    except RPCError as e:
+        logger.error(f"Failed to invite user {user_id} to chat {chat_id}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error inviting user {user_id} to chat {chat_id}: {str(e)}")
         return False
 
 # Helper function to reset Pyrogram session
@@ -327,7 +341,7 @@ async def promote_bot(client: Client, message: Message):
         logger.warning("Invalid /promote command format")
         return
     
-    bot_username = args[1].lstrip("@")  # Allow @Bot or BotUsername
+    bot_username = args[1].lstrip("@")
     try:
         chat_id = int(args[2])
     except ValueError:
@@ -343,11 +357,24 @@ async def promote_bot(client: Client, message: Message):
             logger.warning(f"Invalid chat {chat_id} for /promote")
             return
         
-        # Check if bot is in chat
-        if not await is_user_in_chat(client, chat_id, bot_member.id):
-            await message.reply(f"@{bot_username} is not a member of chat {chat_id}. Please add them to the chat first.")
-            logger.warning(f"@{bot_username} not in chat {chat_id}")
+        # Check target bot status
+        status = await get_user_status(client, chat_id, bot_member.id)
+        if status == "banned":
+            await message.reply(f"@{bot_username} is banned from chat {chat_id}. Please unban them first.")
+            logger.warning(f"@{bot_username} is banned in chat {chat_id}")
             return
+        elif not status:
+            # Try inviting the bot
+            if await invite_user(client, chat_id, bot_member.id):
+                await asyncio.sleep(2)  # Wait for invite to process
+                logger.info(f"Invited @{bot_username} to chat {chat_id}")
+            else:
+                await message.reply(
+                    f"Failed to invite @{bot_username} to chat {chat_id}. "
+                    "Please add them manually or ensure I have 'Invite Users via Link' permission."
+                )
+                logger.error(f"Failed to invite @{bot_username} to chat {chat_id}")
+                return
         
         # Check admin status with fresh data
         privileges = await is_bot_admin(client, chat_id)
@@ -368,12 +395,6 @@ async def promote_bot(client: Client, message: Message):
                     user_id=bot_member.id,
                     privileges=ChatPrivileges(**privileges)
                 )
-                # Try setting custom title as fallback
-                try:
-                    await client.set_chat_administrator_custom_title(chat_id, bot_member.id, "Admin")
-                    logger.info(f"Set custom admin title for @{bot_username} in chat {chat_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to set custom title for @{bot_username} in chat {chat_id}: {str(e)}")
                 await message.reply(f"Successfully promoted @{bot_username} to admin in chat {chat_id} with same permissions")
                 logger.info(f"Promoted @{bot_username} in chat {chat_id} with same permissions")
                 return
@@ -410,8 +431,16 @@ async def promote_bot(client: Client, message: Message):
             )
             logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
         elif "USER_NOT_PARTICIPANT" in error_msg:
-            await message.reply(f"@{bot_username} is not a member of chat {chat_id}. Please add them first.")
-            logger.error(f"Promotion failed: @{bot_username} not in chat {chat_id}")
+            # Try inviting again
+            if await invite_user(client, chat_id, bot_member.id):
+                await message.reply(f"Invited @{bot_username} to chat {chat_id}. Please retry the promotion.")
+                logger.info(f"Invited @{bot_username} to chat {chat_id} after USER_NOT_PARTICIPANT")
+            else:
+                await message.reply(
+                    f"@{bot_username} is not a member of chat {chat_id}, and I couldn't invite them. "
+                    "Please add them manually or check my permissions."
+                )
+                logger.error(f"Failed to invite @{bot_username} to chat {chat_id}")
         else:
             await message.reply(f"Error: {error_msg}")
             logger.error(f"Failed to promote @{bot_username} in {chat_id}: {error_msg}")
@@ -430,7 +459,7 @@ async def promote_bot_all(client: Client, message: Message):
         logger.warning("Invalid /promoteall command format")
         return
     
-    bot_username = args[1].lstrip("@")  # Allow @Bot or BotUsername
+    bot_username = args[1].lstrip("@")
     success_count = 0
     failure_count = 0
     errors = []
@@ -457,12 +486,26 @@ async def promote_bot_all(client: Client, message: Message):
                     logger.warning(f"Invalid chat {chat_id} for promotion")
                     continue
                 
-                # Check if bot is in chat
-                if not await is_user_in_chat(client, chat_id, bot_member.id):
+                # Check target bot status
+                status = await get_user_status(client, chat_id, bot_member.id)
+                if status == "banned":
                     failure_count += 1
-                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} not a member")
-                    logger.warning(f"@{bot_username} not in chat {chat_id}")
+                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} is banned. Please unban them.")
+                    logger.warning(f"@{bot_username} is banned in chat {chat_id}")
                     continue
+                elif not status:
+                    # Try inviting the bot
+                    if await invite_user(client, chat_id, bot_member.id):
+                        await asyncio.sleep(2)
+                        logger.info(f"Invited @{bot_username} to chat {chat_id}")
+                    else:
+                        failure_count += 1
+                        errors.append(
+                            f"{chat_title} (ID: {chat_id}): Failed to invite @{bot_username}. "
+                            "Please add them manually or ensure I have 'Invite Users via Link' permission."
+                        )
+                        logger.error(f"Failed to invite @{bot_username} to chat {chat_id}")
+                        continue
                 
                 # Check admin status with fresh data
                 privileges = await is_bot_admin(client, chat_id)
@@ -483,11 +526,6 @@ async def promote_bot_all(client: Client, message: Message):
                             user_id=bot_member.id,
                             privileges=ChatPrivileges(**privileges)
                         )
-                        try:
-                            await client.set_chat_administrator_custom_title(chat_id, bot_member.id, "Admin")
-                            logger.info(f"Set custom admin title for @{bot_username} in chat {chat_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to set custom title for @{bot_username} in chat {chat_id}: {str(e)}")
                         success_count += 1
                         logger.info(f"Promoted @{bot_username} in chat {chat_id} ({chat_title}) with same permissions")
                         break
@@ -525,8 +563,16 @@ async def promote_bot_all(client: Client, message: Message):
                     )
                     logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
                 elif "USER_NOT_PARTICIPANT" in error_msg:
-                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} not a member")
-                    logger.error(f"Promotion failed: @{bot_username} not in chat {chat_id}")
+                    # Try inviting again
+                    if await invite_user(client, chat_id, bot_member.id):
+                        errors.append(f"{chat_title} (ID: {chat_id}): Invited @{bot_username}, please retry.")
+                        logger.info(f"Invited @{bot_username} to chat {chat_id} after USER_NOT_PARTICIPANT")
+                    else:
+                        errors.append(
+                            f"{chat_title} (ID: {chat_id}): @{bot_username} not a member and couldn't be invited. "
+                            "Please add them manually."
+                        )
+                        logger.error(f"Failed to invite @{bot_username} to chat {chat_id}")
                 else:
                     errors.append(f"{chat_title} (ID: {chat_id}): {error_msg}")
                     logger.error(f"Failed to promote @{bot_username} in {chat_id}: {error_msg}")
@@ -550,11 +596,11 @@ async def promote_bot_all(client: Client, message: Message):
 @app.on_message(filters.command("start") & filters.user(ADMIN_ID))
 async def start(client: Client, message: Message):
     await message.reply(
-        "Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
+        "Hello! I'm a bot that can invite and promote other bots to admin.\n"
         "Commands:\n"
         "/addchat - Add the current chat to the database (use in group/channel)\n"
-        "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
-        "/promoteall <bot_username> - Promote a bot in all stored chats\n"
+        "/promote <bot_username> <chat_id> - Invite and promote a bot in a specific chat\n"
+        "/promoteall <bot_username> - Invite and promote a bot in all stored chats\n"
         "/cleandb - Remove invalid chats from the database\n"
         "/init - Start periodic admin status checks"
     )
