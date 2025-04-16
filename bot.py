@@ -2,7 +2,6 @@
 import logging
 import json
 import os
-import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import RPCError
@@ -71,42 +70,14 @@ async def get_bot_privileges(client: Client, chat_id: int) -> dict:
         logger.error(f"Failed to get bot privileges in {chat_id}: {str(e)}")
         return {}
 
-# Background task to periodically check admin status in chats
-async def check_admin_chats(client: Client):
-    logger.info("Started admin chat checking task")
-    while True:
-        chats = load_chats()
-        new_chats = set(chats)
-        
-        # Since bots can't use get_dialogs, rely on manual chat addition or updates
-        # For simplicity, check known chats and allow manual addition via /addchat
-        for chat_id in chats:
-            try:
-                privileges = await get_bot_privileges(client, chat_id)
-                if not privileges.get("can_promote_members", False):
-                    if chat_id in new_chats:
-                        new_chats.remove(chat_id)
-                        logger.info(f"Removed chat {chat_id} from list (no promote permission)")
-            except RPCError as e:
-                logger.error(f"Failed to check chat {chat_id}: {str(e)}")
-        
-        save_chats(list(new_chats))
-        await asyncio.sleep(300)  # Check every 5 minutes
-
-# Command to manually add a chat (for initial setup or missed chats)
-@app.on_message(filters.command("addchat") & filters.user(ADMIN_ID))
+# Command to add the current chat (run in group/channel)
+@app.on_message(filters.command("addchat") & filters.user(ADMIN_ID) & (filters.group | filters.channel))
 async def add_chat(client: Client, message: Message):
-    logger.info(f"Received /addchat command from {message.from_user.id}")
-    args = message.text.split()
-    
-    if len(args) != 2:
-        await message.reply("Usage: /addchat <chat_id>")
-        logger.warning("Invalid /addchat command format")
-        return
+    logger.info(f"Received /addchat command from {message.from_user.id} in chat {message.chat.id}")
+    chat_id = message.chat.id
+    chats = load_chats()
     
     try:
-        chat_id = int(args[1])
-        chats = load_chats()
         if chat_id not in chats:
             privileges = await get_bot_privileges(client, chat_id)
             if privileges.get("can_promote_members", False):
@@ -115,16 +86,45 @@ async def add_chat(client: Client, message: Message):
                 await message.reply(f"Added chat {chat_id} to the list.")
                 logger.info(f"Added chat {chat_id}")
             else:
-                await message.reply(f"Bot is not an admin with 'Add New Admins' permission in chat {chat_id}.")
+                await message.reply("I am not an admin with 'Add New Admins' permission in this chat.")
                 logger.warning(f"Bot lacks promote permission in chat {chat_id}")
         else:
             await message.reply(f"Chat {chat_id} is already in the list.")
-    except ValueError:
-        await message.reply("Invalid chat_id format. Please provide a numeric chat ID (e.g., -100123456789).")
-        logger.warning("Invalid chat_id format in /addchat")
     except RPCError as e:
         await message.reply(f"Error: {str(e)}")
-        logger.error(f"Failed to add chat {args[1]}: {str(e)}")
+        logger.error(f"Failed to add chat {chat_id}: {str(e)}")
+    except Exception as e:
+        await message.reply("An unexpected error occurred. Check logs for details.")
+        logger.error(f"Unexpected error in /addchat: {str(e)}")
+
+# Command to refresh the chat list
+@app.on_message(filters.command("refresh") & filters.user(ADMIN_ID))
+async def refresh_chats(client: Client, message: Message):
+    logger.info(f"Received /refresh command from {message.from_user.id}")
+    chats = load_chats()
+    valid_chats = []
+    removed_count = 0
+    
+    try:
+        for chat_id in chats:
+            try:
+                privileges = await get_bot_privileges(client, chat_id)
+                if privileges.get("can_promote_members", False):
+                    valid_chats.append(chat_id)
+                else:
+                    removed_count += 1
+                    logger.info(f"Removed chat {chat_id} during refresh (no promote permission)")
+            except RPCError as e:
+                removed_count += 1
+                logger.error(f"Failed to check chat {chat_id} during refresh: {str(e)}")
+        
+        save_chats(valid_chats)
+        await message.reply(f"Refresh complete! {len(valid_chats)} chats valid, {removed_count} removed. Use /checkchats to view.")
+        logger.info(f"Refresh completed: {len(valid_chats)} chats valid, {removed_count} removed")
+    
+    except Exception as e:
+        await message.reply("An unexpected error occurred. Check logs for details.")
+        logger.error(f"Unexpected error in /refresh: {str(e)}")
 
 # Command to check registered chats
 @app.on_message(filters.command("checkchats") & filters.user(ADMIN_ID))
@@ -135,7 +135,7 @@ async def check_chats(client: Client, message: Message):
         chat_list = "\n".join([f"- {chat_id}" for chat_id in chats])
         await message.reply(f"Registered chats:\n{chat_list}")
     else:
-        await message.reply("No chats registered. Add me as an admin with 'Add New Admins' permission and use /addchat <chat_id>.")
+        await message.reply("No chats registered. Use /addchat in groups/channels where I'm an admin with 'Add New Admins' permission.")
     logger.info(f"Checked chats: {chats}")
 
 # Command to promote a bot to admin in a specific chat with same permissions
@@ -198,7 +198,7 @@ async def promote_bot_all(client: Client, message: Message):
         bot_member = await client.get_users(bot_username)
         chats = load_chats()
         if not chats:
-            await message.reply("No chats registered. Add me as an admin with 'Add New Admins' permission and use /addchat <chat_id>.")
+            await message.reply("No chats registered. Use /addchat in groups/channels where I'm an admin with 'Add New Admins' permission.")
             logger.warning("No chats registered for /promoteall")
             return
         
@@ -239,19 +239,12 @@ async def promote_bot_all(client: Client, message: Message):
 async def start(client: Client, message: Message):
     await message.reply("Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
                        "Commands:\n"
-                       "/addchat <chat_id> - Add a chat to the list\n"
+                       "/addchat - Add the current group/channel (run in chat)\n"
+                       "/refresh - Refresh the chat list\n"
                        "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
                        "/promoteall <bot_username> - Promote a bot in all registered chats\n"
                        "/checkchats - View registered chats")
     logger.info(f"Start command received from {message.from_user.id}")
-
-# Start the admin chat checking task when the bot starts
-@app.on_message(filters.command("start") & filters.user(ADMIN_ID))
-async def start_with_task(client: Client, message: Message):
-    await start(client, message)
-    # Start the background task if not already running
-    if not hasattr(client, "admin_check_task"):
-        client.admin_check_task = asyncio.create_task(check_admin_chats(client))
 
 # Run the bot
 if __name__ == "__main__":
