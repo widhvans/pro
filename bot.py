@@ -53,27 +53,33 @@ async def get_bot_privileges(client: Client, chat_id: int, retries=3, delay=2) -
         try:
             bot_member = await client.get_chat_member(chat_id, "me")
             logger.info(f"get_chat_member response for {chat_id}: status={bot_member.status}, privileges={getattr(bot_member, 'privileges', None)}")
+            
             if bot_member.status == "administrator":
                 privileges = {
-                    "can_manage_chat": bot_member.privileges.can_manage_chat,
-                    "can_delete_messages": bot_member.privileges.can_delete_messages,
-                    "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
-                    "can_restrict_members": bot_member.privileges.can_restrict_members,
-                    "can_promote_members": bot_member.privileges.can_promote_members,
-                    "can_change_info": bot_member.privileges.can_change_info,
-                    "can_invite_users": bot_member.privileges.can_invite_users,
-                    "can_pin_messages": bot_member.privileges.can_pin_messages,
+                    "can_manage_chat": getattr(bot_member.privileges, "can_manage_chat", False),
+                    "can_delete_messages": getattr(bot_member.privileges, "can_delete_messages", False),
+                    "can_manage_video_chats": getattr(bot_member.privileges, "can_manage_video_chats", False),
+                    "can_restrict_members": getattr(bot_member.privileges, "can_restrict_members", False),
+                    "can_promote_members": getattr(bot_member.privileges, "can_promote_members", False),
+                    "can_change_info": getattr(bot_member.privileges, "can_change_info", False),
+                    "can_invite_users": getattr(bot_member.privileges, "can_invite_users", False),
+                    "can_pin_messages": getattr(bot_member.privileges, "can_pin_messages", False),
                 }
-                logger.info(f"Bot privileges in {chat_id}: {privileges}")
+                logger.info(f"Processed bot privileges in {chat_id}: {privileges}")
                 return privileges
-            else:
-                logger.warning(f"Bot is not an admin in chat {chat_id}: status={bot_member.status}")
-                return {}
+            
+            logger.warning(f"Bot is not an admin in chat {chat_id}: status={bot_member.status}")
+            return {}
+        
         except RPCError as e:
             logger.error(f"Attempt {attempt}/{retries} - Failed to get bot privileges in {chat_id}: {str(e)}")
             if attempt < retries:
                 await asyncio.sleep(delay)
             continue
+        except Exception as e:
+            logger.error(f"Unexpected error in get_bot_privileges for {chat_id}: {str(e)}")
+            return {}
+    
     logger.error(f"Failed to get bot privileges in {chat_id} after {retries} attempts")
     return {}
 
@@ -85,13 +91,12 @@ async def verify_admin(client: Client, message: Message):
     
     try:
         privileges = await get_bot_privileges(client, chat_id)
-        if privileges:
-            if privileges.get("can_promote_members", False):
-                await message.reply("I am an admin with 'Add New Admins' permission in this chat.")
-                logger.info(f"Bot confirmed as admin with promote permission in {chat_id}")
-            else:
-                await message.reply("I am an admin but lack 'Add New Admins' permission in this chat.")
-                logger.info(f"Bot is admin but lacks promote permission in {chat_id}")
+        if privileges and privileges.get("can_promote_members", False):
+            await message.reply("I am an admin with 'Add New Admins' permission in this chat.")
+            logger.info(f"Bot confirmed as admin with promote permission in {chat_id}")
+        elif privileges:
+            await message.reply("I am an admin but lack 'Add New Admins' permission in this chat.")
+            logger.info(f"Bot is admin but lacks promote permission in {chat_id}")
         else:
             await message.reply("I am not an admin in this chat.")
             logger.info(f"Bot is not an admin in {chat_id}")
