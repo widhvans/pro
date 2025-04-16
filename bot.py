@@ -1,5 +1,7 @@
 # bot.py
 import logging
+import json
+import os
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import RPCError
@@ -20,6 +22,21 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# File to store chat IDs
+CHAT_FILE = "chats.json"
+
+# Helper function to load chat IDs from JSON
+def load_chats():
+    if os.path.exists(CHAT_FILE):
+        with open(CHAT_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+# Helper function to save chat IDs to JSON
+def save_chats(chats):
+    with open(CHAT_FILE, "w") as f:
+        json.dump(chats, f, indent=4)
 
 # Helper function to get the bot's own admin privileges in a chat
 async def get_bot_privileges(client: Client, chat_id: int) -> dict:
@@ -42,6 +59,34 @@ async def get_bot_privileges(client: Client, chat_id: int) -> dict:
     except RPCError as e:
         logger.error(f"Failed to get bot privileges in {chat_id}: {str(e)}")
         return {}
+
+# Command to add a chat ID to the list
+@app.on_message(filters.command("addchat") & filters.user(ADMIN_ID))
+async def add_chat(client: Client, message: Message):
+    logger.info(f"Received /addchat command from {message.from_user.id}")
+    args = message.text.split()
+    
+    if len(args) != 2:
+        await message.reply("Usage: /addchat <chat_id>")
+        logger.warning("Invalid /addchat command format")
+        return
+    
+    try:
+        chat_id = int(args[1])
+        chats = load_chats()
+        if chat_id not in chats:
+            chats.append(chat_id)
+            save_chats(chats)
+            await message.reply(f"Added chat {chat_id} to the list.")
+            logger.info(f"Added chat {chat_id}")
+        else:
+            await message.reply(f"Chat {chat_id} is already in the list.")
+    except ValueError:
+        await message.reply("Invalid chat_id format. Please provide a numeric chat ID (e.g., -100123456789).")
+        logger.warning("Invalid chat_id format in /addchat")
+    except Exception as e:
+        await message.reply("An unexpected error occurred. Check logs for details.")
+        logger.error(f"Unexpected error in /addchat: {str(e)}")
 
 # Command to promote a bot to admin in a specific chat with same permissions
 @app.on_message(filters.command("promote") & filters.user(ADMIN_ID))
@@ -84,7 +129,7 @@ async def promote_bot(client: Client, message: Message):
         await message.reply("An unexpected error occurred. Check logs for details.")
         logger.error(f"Unexpected error in /promote: {str(e)}")
 
-# Command to promote a bot to admin in all chats with same permissions
+# Command to promote a bot to admin in all stored chats with same permissions
 @app.on_message(filters.command("promoteall") & filters.user(ADMIN_ID))
 async def promote_bot_all(client: Client, message: Message):
     logger.info(f"Received /promoteall command from {message.from_user.id}")
@@ -101,29 +146,33 @@ async def promote_bot_all(client: Client, message: Message):
     
     try:
         bot_member = await client.get_users(bot_username)
-        # Iterate through all dialogs (groups/channels)
-        async for dialog in client.get_dialogs():
-            chat = dialog.chat
-            if chat.type in ["group", "supergroup", "channel"]:
-                try:
-                    # Get the current bot's privileges in this chat
-                    privileges = await get_bot_privileges(client, chat.id)
-                    if not privileges:
-                        failure_count += 1
-                        logger.warning(f"Skipping {chat.id}: Bot is not an admin or lacks permissions")
-                        continue
-                    
-                    # Promote the bot with the same privileges
-                    await client.promote_chat_member(
-                        chat_id=chat.id,
-                        user_id=bot_member.id,
-                        privileges=ChatPrivileges(**privileges)
-                    )
-                    success_count += 1
-                    logger.info(f"Promoted {bot_username} in chat {chat.id} with same permissions")
-                except RPCError as e:
+        chats = load_chats()
+        if not chats:
+            await message.reply("No chats registered. Use /addchat to add chats.")
+            logger.warning("No chats registered for /promoteall")
+            return
+        
+        for chat_id in chats:
+            try:
+                chat = await client.get_chat(chat_id)
+                # Get the current bot's privileges in this chat
+                privileges = await get_bot_privileges(client, chat.id)
+                if not privileges:
                     failure_count += 1
-                    logger.error(f"Failed to promote {bot_username} in {chat.id}: {str(e)}")
+                    logger.warning(f"Skipping {chat.id}: Bot is not an admin or lacks permissions")
+                    continue
+                
+                # Promote the bot with the same privileges
+                await client.promote_chat_member(
+                    chat_id=chat.id,
+                    user_id=bot_member.id,
+                    privileges=ChatPrivileges(**privileges)
+                )
+                success_count += 1
+                logger.info(f"Promoted {bot_username} in chat {chat.id} with same permissions")
+            except RPCError as e:
+                failure_count += 1
+                logger.error(f"Failed to promote {bot_username} in {chat.id}: {str(e)}")
         
         await message.reply(
             f"Promotion complete!\n"
@@ -139,7 +188,10 @@ async def promote_bot_all(client: Client, message: Message):
 @app.on_message(filters.command("start") & filters.user(ADMIN_ID))
 async def start(client: Client, message: Message):
     await message.reply("Hello! I'm a bot that can promote other bots to admin with same permissions.\n"
-                       "Use /promote <bot_username> <chat_id> or /promoteall <bot_username>")
+                       "Commands:\n"
+                       "/addchat <chat_id> - Add a chat to the list\n"
+                       "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
+                       "/promoteall <bot_username> - Promote a bot in all registered chats")
     logger.info(f"Start command received from {message.from_user.id}")
 
 # Run the bot
