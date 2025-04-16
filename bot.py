@@ -60,6 +60,9 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                 if not privileges["can_promote_members"]:
                     logger.warning(f"Bot lacks 'can_promote_members' permission in chat {chat_id}")
                     return {}
+                if not privileges["can_invite_users"]:
+                    logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
+                    return {}
                 
                 # Test actual promotion capability with ADMIN_ID
                 chat = await client.get_chat(chat_id)
@@ -111,6 +114,9 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                     logger.info(f"Bot found in admins list for chat {chat_id}: privileges={privileges}")
                     if not privileges["can_promote_members"]:
                         logger.warning(f"Bot lacks 'can_promote_members' permission in chat {chat_id}")
+                        return {}
+                    if not privileges["can_invite_users"]:
+                        logger.warning(f"Bot lacks 'can_invite_users' permission in chat {chat_id}")
                         return {}
                     if chat.type in ["supergroup", "channel"]:
                         try:
@@ -170,10 +176,23 @@ async def get_user_status(client: Client, chat_id: int, user_id: int) -> str:
         logger.warning(f"User {user_id} not in chat {chat_id}: {str(e)}")
         return None
 
+# Helper function to unban a user/bot from the chat
+async def unban_user(client: Client, chat_id: int, user_id: int) -> bool:
+    try:
+        await client.unban_chat_member(chat_id, user_id)
+        logger.info(f"Successfully unbanned user {user_id} from chat {chat_id}")
+        return True
+    except RPCError as e:
+        logger.error(f"Failed to unban user {user_id} from chat {chat_id}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error unbanning user {user_id} from chat {chat_id}: {str(e)}")
+        return False
+
 # Helper function to invite a user/bot to the chat
 async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
     try:
-        await client.invite_chat_members(chat_id, [user_id])
+        await client.add_chat_members(chat_id, [user_id])
         logger.info(f"Successfully invited user {user_id} to chat {chat_id}")
         return True
     except RPCError as e:
@@ -360,13 +379,32 @@ async def promote_bot(client: Client, message: Message):
         # Check target bot status
         status = await get_user_status(client, chat_id, bot_member.id)
         if status == "banned":
-            await message.reply(f"@{bot_username} is banned from chat {chat_id}. Please unban them first.")
-            logger.warning(f"@{bot_username} is banned in chat {chat_id}")
-            return
+            # Try unbanning
+            if await unban_user(client, chat_id, bot_member.id):
+                logger.info(f"Unbanned @{bot_username} in chat {chat_id}")
+                await asyncio.sleep(2)  # Wait for unban to process
+            else:
+                await message.reply(
+                    f"@{bot_username} is banned from chat {chat_id}, and I couldn't unban them. "
+                    "Please unban them manually in chat settings > Banned Users."
+                )
+                logger.error(f"Failed to unban @{bot_username} in chat {chat_id}")
+                return
+            # Try inviting after unban
+            if await invite_user(client, chat_id, bot_member.id):
+                await asyncio.sleep(2)
+                logger.info(f"Invited @{bot_username} to chat {chat_id} after unban")
+            else:
+                await message.reply(
+                    f"Failed to invite @{bot_username} to chat {chat_id} after unbanning. "
+                    "Please add them manually or ensure I have 'Invite Users via Link' permission."
+                )
+                logger.error(f"Failed to invite @{bot_username} to chat {chat_id} after unban")
+                return
         elif not status:
             # Try inviting the bot
             if await invite_user(client, chat_id, bot_member.id):
-                await asyncio.sleep(2)  # Wait for invite to process
+                await asyncio.sleep(2)
                 logger.info(f"Invited @{bot_username} to chat {chat_id}")
             else:
                 await message.reply(
@@ -489,10 +527,30 @@ async def promote_bot_all(client: Client, message: Message):
                 # Check target bot status
                 status = await get_user_status(client, chat_id, bot_member.id)
                 if status == "banned":
-                    failure_count += 1
-                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} is banned. Please unban them.")
-                    logger.warning(f"@{bot_username} is banned in chat {chat_id}")
-                    continue
+                    # Try unbanning
+                    if await unban_user(client, chat_id, bot_member.id):
+                        logger.info(f"Unbanned @{bot_username} in chat {chat_id}")
+                        await asyncio.sleep(2)
+                    else:
+                        failure_count += 1
+                        errors.append(
+                            f"{chat_title} (ID: {chat_id}): @{bot_username} is banned and couldn't be unbanned. "
+                            "Please unban them manually in chat settings > Banned Users."
+                        )
+                        logger.error(f"Failed to unban @{bot_username} in chat {chat_id}")
+                        continue
+                    # Try inviting after unban
+                    if await invite_user(client, chat_id, bot_member.id):
+                        await asyncio.sleep(2)
+                        logger.info(f"Invited @{bot_username} to chat {chat_id} after unban")
+                    else:
+                        failure_count += 1
+                        errors.append(
+                            f"{chat_title} (ID: {chat_id}): Failed to invite @{bot_username} after unbanning. "
+                            "Please add them manually or ensure I have 'Invite Users via Link' permission."
+                        )
+                        logger.error(f"Failed to invite @{bot_username} to chat {chat_id} after unban")
+                        continue
                 elif not status:
                     # Try inviting the bot
                     if await invite_user(client, chat_id, bot_member.id):
