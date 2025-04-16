@@ -3,7 +3,7 @@ import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import RPCError
-from config import BOT_TOKEN, ADMIN_ID
+from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
 
 # Set up logging
 logging.basicConfig(
@@ -14,7 +14,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Pyrogram client
-app = Client("admin_promoter_bot", bot_token=BOT_TOKEN)
+app = Client(
+    "admin_promoter_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 # Helper function to get the bot's own admin privileges in a chat
 async def get_bot_privileges(client: Client, chat_id: int) -> dict:
