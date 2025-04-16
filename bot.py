@@ -25,6 +25,16 @@ app = Client(
 )
 mongo_db = MongoDB()
 
+# Helper function to validate chat accessibility
+async def is_chat_valid(client: Client, chat_id: int) -> bool:
+    try:
+        await client.get_chat(chat_id)
+        logger.info(f"Chat {chat_id} is valid and accessible")
+        return True
+    except RPCError as e:
+        logger.error(f"Chat {chat_id} is invalid or inaccessible: {str(e)}")
+        return False
+
 # Helper function to check if bot is admin with real-world promotion test
 async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry_delay: float = 1.0) -> dict:
     bot = await client.get_me()
@@ -55,14 +65,12 @@ async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry
                 chat = await client.get_chat(chat_id)
                 if chat.type in ["supergroup", "channel"]:
                     try:
-                        # Use ADMIN_ID for a safe test promotion
                         test_privileges = ChatPrivileges(can_manage_chat=True)  # Minimal privilege for test
                         await client.promote_chat_member(
                             chat_id=chat_id,
                             user_id=ADMIN_ID,
                             privileges=test_privileges
                         )
-                        # Revert immediately to avoid side effects
                         await client.promote_chat_member(
                             chat_id=chat_id,
                             user_id=ADMIN_ID,
@@ -251,6 +259,11 @@ async def add_chat(client: Client, message: Message):
     chat_title = chat.title or str(chat_id)
     
     try:
+        if not await is_chat_valid(client, chat_id):
+            await message.reply(f"Chat {chat_id} is invalid or inaccessible. Please verify the chat exists and I'm a member.")
+            logger.warning(f"Invalid chat {chat_id} for /addchat")
+            return
+        
         privileges = await is_bot_admin(client, chat_id)
         if not privileges:
             await message.reply(
@@ -278,6 +291,31 @@ async def add_chat(client: Client, message: Message):
         await message.reply("An unexpected error occurred. Check logs for details.")
         logger.error(f"Unexpected error in /addchat: {str(e)}")
 
+# Command to clean invalid chats from the database
+@app.on_message(filters.command("cleandb") & filters.user(ADMIN_ID))
+async def clean_db(client: Client, message: Message):
+    logger.info(f"Received /cleandb command from {message.from_user.id}")
+    try:
+        chats = mongo_db.get_all_chats()
+        if not chats:
+            await message.reply("No chats found in the database.")
+            return
+        
+        deleted_count = 0
+        for chat in chats:
+            chat_id = chat["chat_id"]
+            if not await is_chat_valid(client, chat_id):
+                if mongo_db.delete_chat(chat_id):
+                    deleted_count += 1
+                    logger.info(f"Removed invalid chat {chat_id} from database")
+        
+        await message.reply(f"Database cleanup complete. Removed {deleted_count} invalid chats.")
+        logger.info(f"Cleaned up {deleted_count} invalid chats from MongoDB")
+        
+    except Exception as e:
+        await message.reply("An unexpected error occurred. Check logs for details.")
+        logger.error(f"Unexpected error in /cleandb: {str(e)}")
+
 # Command to promote a bot to admin in a specific chat with same permissions
 @app.on_message(filters.command("promote") & filters.user(ADMIN_ID))
 async def promote_bot(client: Client, message: Message):
@@ -289,7 +327,7 @@ async def promote_bot(client: Client, message: Message):
         logger.warning("Invalid /promote command format")
         return
     
-    bot_username = args[1]
+    bot_username = args[1].lstrip("@")  # Allow @Bot or BotUsername
     try:
         chat_id = int(args[2])
     except ValueError:
@@ -300,12 +338,15 @@ async def promote_bot(client: Client, message: Message):
     try:
         # Get target bot
         bot_member = await client.get_users(bot_username)
-        chat = await client.get_chat(chat_id)
+        if not await is_chat_valid(client, chat_id):
+            await message.reply(f"Chat {chat_id} is invalid or inaccessible. Please verify the chat exists and I'm a member.")
+            logger.warning(f"Invalid chat {chat_id} for /promote")
+            return
         
         # Check if bot is in chat
         if not await is_user_in_chat(client, chat_id, bot_member.id):
-            await message.reply(f"{bot_username} is not a member of {chat.title or chat.id}. Please add them to the chat first.")
-            logger.warning(f"{bot_username} not in chat {chat_id}")
+            await message.reply(f"@{bot_username} is not a member of chat {chat_id}. Please add them to the chat first.")
+            logger.warning(f"@{bot_username} not in chat {chat_id}")
             return
         
         # Check admin status with fresh data
@@ -330,11 +371,11 @@ async def promote_bot(client: Client, message: Message):
                 # Try setting custom title as fallback
                 try:
                     await client.set_chat_administrator_custom_title(chat_id, bot_member.id, "Admin")
-                    logger.info(f"Set custom admin title for {bot_username} in chat {chat_id}")
+                    logger.info(f"Set custom admin title for @{bot_username} in chat {chat_id}")
                 except Exception as e:
-                    logger.warning(f"Failed to set custom title for {bot_username} in chat {chat_id}: {str(e)}")
-                await message.reply(f"Successfully promoted {bot_username} to admin in {chat.title or chat.id} with same permissions")
-                logger.info(f"Promoted {bot_username} in chat {chat_id} with same permissions")
+                    logger.warning(f"Failed to set custom title for @{bot_username} in chat {chat_id}: {str(e)}")
+                await message.reply(f"Successfully promoted @{bot_username} to admin in chat {chat_id} with same permissions")
+                logger.info(f"Promoted @{bot_username} in chat {chat_id} with same permissions")
                 return
             except RPCError as e:
                 error_msg = str(e)
@@ -355,7 +396,13 @@ async def promote_bot(client: Client, message: Message):
         
     except RPCError as e:
         error_msg = str(e)
-        if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
+        if "PEER_ID_INVALID" in error_msg:
+            await message.reply(
+                f"Chat {chat_id} is invalid or inaccessible. "
+                "Please verify the chat exists, I'm a member, and the ID is correct (e.g., -100123456789)."
+            )
+            logger.error(f"Promotion failed: Invalid chat {chat_id}")
+        elif "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
             await message.reply(
                 "Failed to promote: I need the 'Invite Users via Link' permission. "
                 "Please go to chat settings > Administrators > Edit my permissions and enable 'Invite Users via Link' and 'Add New Admins'. "
@@ -363,11 +410,11 @@ async def promote_bot(client: Client, message: Message):
             )
             logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
         elif "USER_NOT_PARTICIPANT" in error_msg:
-            await message.reply(f"{bot_username} is not a member of {chat.title or chat.id}. Please add them first.")
-            logger.error(f"Promotion failed: {bot_username} not in chat {chat_id}")
+            await message.reply(f"@{bot_username} is not a member of chat {chat_id}. Please add them first.")
+            logger.error(f"Promotion failed: @{bot_username} not in chat {chat_id}")
         else:
             await message.reply(f"Error: {error_msg}")
-            logger.error(f"Failed to promote {bot_username} in {chat_id}: {error_msg}")
+            logger.error(f"Failed to promote @{bot_username} in {chat_id}: {error_msg}")
     except Exception as e:
         await message.reply("An unexpected error occurred. Check logs for details.")
         logger.error(f"Unexpected error in /promote: {str(e)}")
@@ -379,11 +426,11 @@ async def promote_bot_all(client: Client, message: Message):
     args = message.text.split()
     
     if len(args) != 2:
-        await message.reply("Usage: /promoteall <bot_username>")
+        await message.reply("Usage: /promoteall <bot_username> (e.g., /promoteall @BotUsername)")
         logger.warning("Invalid /promoteall command format")
         return
     
-    bot_username = args[1]
+    bot_username = args[1].lstrip("@")  # Allow @Bot or BotUsername
     success_count = 0
     failure_count = 0
     errors = []
@@ -400,11 +447,21 @@ async def promote_bot_all(client: Client, message: Message):
             chat_id = chat["chat_id"]
             chat_title = chat.get("chat_title", str(chat_id))
             try:
+                # Validate chat
+                if not await is_chat_valid(client, chat_id):
+                    failure_count += 1
+                    errors.append(
+                        f"{chat_title} (ID: {chat_id}): Chat is invalid or inaccessible. "
+                        "Verify the chat exists and I'm a member, or use /cleandb to remove it."
+                    )
+                    logger.warning(f"Invalid chat {chat_id} for promotion")
+                    continue
+                
                 # Check if bot is in chat
                 if not await is_user_in_chat(client, chat_id, bot_member.id):
                     failure_count += 1
-                    errors.append(f"{chat_title} (ID: {chat_id}): {bot_username} not a member")
-                    logger.warning(f"{bot_username} not in chat {chat_id}")
+                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} not a member")
+                    logger.warning(f"@{bot_username} not in chat {chat_id}")
                     continue
                 
                 # Check admin status with fresh data
@@ -428,11 +485,11 @@ async def promote_bot_all(client: Client, message: Message):
                         )
                         try:
                             await client.set_chat_administrator_custom_title(chat_id, bot_member.id, "Admin")
-                            logger.info(f"Set custom admin title for {bot_username} in chat {chat_id}")
+                            logger.info(f"Set custom admin title for @{bot_username} in chat {chat_id}")
                         except Exception as e:
-                            logger.warning(f"Failed to set custom title for {bot_username} in chat {chat_id}: {str(e)}")
+                            logger.warning(f"Failed to set custom title for @{bot_username} in chat {chat_id}: {str(e)}")
                         success_count += 1
-                        logger.info(f"Promoted {bot_username} in chat {chat_id} ({chat_title}) with same permissions")
+                        logger.info(f"Promoted @{bot_username} in chat {chat_id} ({chat_title}) with same permissions")
                         break
                     except RPCError as e:
                         error_msg = str(e)
@@ -455,24 +512,30 @@ async def promote_bot_all(client: Client, message: Message):
             except RPCError as e:
                 failure_count += 1
                 error_msg = str(e)
-                if "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
+                if "PEER_ID_INVALID" in error_msg:
+                    errors.append(
+                        f"{chat_title} (ID: {chat_id}): Chat is invalid or inaccessible. "
+                        "Verify the chat exists and I'm a member, or use /cleandb to remove it."
+                    )
+                    logger.error(f"Promotion failed: Invalid chat {chat_id}")
+                elif "CHAT_ADMIN_INVITE_REQUIRED" in error_msg:
                     errors.append(
                         f"{chat_title} (ID: {chat_id}): Missing 'Invite Users via Link' permission. "
                         "Enable it in chat settings > Administrators or grant full admin rights."
                     )
                     logger.error(f"Promotion failed in {chat_id}: Missing 'Invite Users' permission")
                 elif "USER_NOT_PARTICIPANT" in error_msg:
-                    errors.append(f"{chat_title} (ID: {chat_id}): {bot_username} not a member")
-                    logger.error(f"Promotion failed: {bot_username} not in chat {chat_id}")
+                    errors.append(f"{chat_title} (ID: {chat_id}): @{bot_username} not a member")
+                    logger.error(f"Promotion failed: @{bot_username} not in chat {chat_id}")
                 else:
                     errors.append(f"{chat_title} (ID: {chat_id}): {error_msg}")
-                    logger.error(f"Failed to promote {bot_username} in {chat_id}: {error_msg}")
+                    logger.error(f"Failed to promote @{bot_username} in {chat_id}: {error_msg}")
             except Exception as e:
                 failure_count += 1
                 errors.append(f"{chat_title} (ID: {chat_id}): Unexpected error")
-                logger.error(f"Unexpected error promoting {bot_username} in {chat_id}: {str(e)}")
+                logger.error(f"Unexpected error promoting @{bot_username} in {chat_id}: {str(e)}")
         
-        reply = f"Promotion complete!\nSuccessfully promoted {bot_username} in {success_count} chats.\nFailed in {failure_count} chats."
+        reply = f"Promotion complete!\nSuccessfully promoted @{bot_username} in {success_count} chats.\nFailed in {failure_count} chats."
         if errors:
             reply += "\n\nErrors:\n" + "\n".join([f"- {e}" for e in errors[:5]])
             if len(errors) > 5:
@@ -492,6 +555,7 @@ async def start(client: Client, message: Message):
         "/addchat - Add the current chat to the database (use in group/channel)\n"
         "/promote <bot_username> <chat_id> - Promote a bot in a specific chat\n"
         "/promoteall <bot_username> - Promote a bot in all stored chats\n"
+        "/cleandb - Remove invalid chats from the database\n"
         "/init - Start periodic admin status checks"
     )
     logger.info(f"Start command received from {message.from_user.id}")
