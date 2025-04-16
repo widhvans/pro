@@ -1,7 +1,7 @@
 # companion_bot.py
 import logging
 from pyrogram import Client, filters
-from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
+from config import API_ID, API_HASH, ADMIN_ID
 
 # Set up logging
 logging.basicConfig(
