@@ -1,8 +1,9 @@
 # bot.py
 import logging
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges, ChatMemberUpdated
-from pyrogram.errors import RPCError
+from pyrogram.errors import RPCError, FloodWait
 from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
 from database import MongoDB
 
@@ -23,53 +24,74 @@ app = Client(
 )
 mongo_db = MongoDB()
 
-# Helper function to get the bot's own admin privileges in a chat
-async def get_bot_privileges(client: Client, chat_id: int) -> dict:
-    try:
-        bot_member = await client.get_chat_member(chat_id, "me")
-        if bot_member.status == "administrator":
-            return {
-                "can_manage_chat": bot_member.privileges.can_manage_chat,
-                "can_delete_messages": bot_member.privileges.can_delete_messages,
-                "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
-                "can_restrict_members": bot_member.privileges.can_restrict_members,
-                "can_promote_members": bot_member.privileges.can_promote_members,
-                "can_change_info": bot_member.privileges.can_change_info,
-                "can_invite_users": bot_member.privileges.can_invite_users,
-                "can_pin_messages": bot_member.privileges.can_pin_messages,
-            }
-        else:
-            logger.warning(f"Bot is not an admin in chat {chat_id}")
+# Helper function to check if bot is admin with retries
+async def is_bot_admin(client: Client, chat_id: int, max_retries: int = 3, retry_delay: float = 1.0) -> dict:
+    for attempt in range(max_retries):
+        try:
+            bot = await client.get_me()
+            bot_member = await client.get_chat_member(chat_id, bot.id)
+            logger.info(f"Admin check attempt {attempt + 1}/{max_retries} for chat {chat_id}: status={bot_member.status}")
+            if bot_member.status in ["administrator", "creator"]:
+                return {
+                    "can_manage_chat": bot_member.privileges.can_manage_chat,
+                    "can_delete_messages": bot_member.privileges.can_delete_messages,
+                    "can_manage_video_chats": bot_member.privileges.can_manage_video_chats,
+                    "can_restrict_members": bot_member.privileges.can_restrict_members,
+                    "can_promote_members": bot_member.privileges.can_promote_members,
+                    "can_change_info": bot_member.privileges.can_change_info,
+                    "can_invite_users": bot_member.privileges.can_invite_users,
+                    "can_pin_messages": bot_member.privileges.can_pin_messages,
+                }
+            else:
+                logger.warning(f"Bot is not an admin in chat {chat_id}: status={bot_member.status}")
+                return {}
+        except FloodWait as e:
+            logger.warning(f"Flood wait {e.x}s during admin check for chat {chat_id}, attempt {attempt + 1}/{max_retries}")
+            await asyncio.sleep(e.x)
+        except RPCError as e:
+            logger.error(f"Failed to check admin status in chat {chat_id}, attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"Unexpected error checking admin status in chat {chat_id}: {str(e)}")
             return {}
-    except RPCError as e:
-        logger.error(f"Failed to get bot privileges in {chat_id}: {str(e)}")
-        return {}
+    logger.error(f"Failed to verify bot admin status in chat {chat_id} after {max_retries} attempts")
+    return {}
 
 # Handler for when the bot's chat member status is updated
 @app.on_chat_member_updated()
 async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
-    logger.info(f"Chat member update: chat_id={update.chat.id}, user_id={update.new_chat_member.user.id if update.new_chat_member else None}, status={update.new_chat_member.status if update.new_chat_member else None}")
     chat = update.chat
     new_member = update.new_chat_member
+    logger.info(f"Chat member update: chat_id={chat.id}, user_id={new_member.user.id if new_member else None}, status={new_member.status if new_member else None}")
+    
     bot = await client.get_me()
-    if new_member and new_member.user.id == bot.id and new_member.status in ["member", "administrator"]:
-        # Bot was added to a chat or made admin
-        chat_type = chat.type  # 'group', 'supergroup', or 'channel'
+    if new_member and new_member.user.id == bot.id and new_member.status in ["member", "administrator", "creator"]:
+        # Bot was added to a chat or status changed
+        chat_type = chat.type.value  # Get string value (e.g., 'supergroup')
         chat_id = chat.id
         chat_title = chat.title or str(chat_id)
+        
         if chat_type in ["group", "supergroup", "channel"]:
-            if mongo_db.save_chat(chat_id, chat_type, chat_title):
-                await client.send_message(
-                    ADMIN_ID,
-                    f"Bot added to {chat_type} {chat_title} (ID: {chat_id}) and saved to database"
-                )
-                logger.info(f"Bot added to {chat_type} {chat_id} ({chat_title}) and saved to database")
+            # Verify admin status
+            privileges = await is_bot_admin(client, chat_id)
+            if privileges:
+                if mongo_db.save_chat(chat_id, chat_type, chat_title):
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"Bot added or promoted to admin in {chat_type} {chat_title} (ID: {chat_id}) and saved to database"
+                    )
+                    logger.info(f"Bot saved chat {chat_id} ({chat_title}, type: {chat_type}) to database")
+                else:
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"Failed to save {chat_type} {chat_title} (ID: {chat_id}) to database"
+                    )
+                    logger.error(f"Failed to save chat {chat_id} to database")
             else:
-                await client.send_message(
-                    ADMIN_ID,
-                    f"Failed to save {chat_type} {chat_title} (ID: {chat_id}) to database"
-                )
-                logger.error(f"Failed to save chat {chat_id} to database")
+                logger.info(f"Bot not an admin in {chat_id}, skipping database save")
+        else:
+            logger.info(f"Ignored chat {chat_id}: type {chat_type} is not group/supergroup/channel")
 
 # Command to manually add the current chat to the database
 @app.on_message(filters.command("addchat") & filters.user(ADMIN_ID) & (filters.group | filters.channel))
@@ -82,8 +104,8 @@ async def add_chat(client: Client, message: Message):
     
     try:
         # Check if bot is an admin
-        bot_member = await client.get_chat_member(chat_id, "me")
-        if bot_member.status != "administrator":
+        privileges = await is_bot_admin(client, chat_id)
+        if not privileges:
             await message.reply("I must be an admin to add this chat.")
             logger.warning(f"Bot is not an admin in chat {chat_id}")
             return
@@ -119,7 +141,12 @@ async def promote_bot(client: Client, message: Message):
         return
     
     bot_username = args[1]
-    chat_id = args[2]
+    try:
+        chat_id = int(args[2])
+    except ValueError:
+        await message.reply("Invalid chat_id format. Use a numeric ID (e.g., -100123456789)")
+        logger.error("Invalid chat_id format in /promote")
+        return
     
     try:
         # Check if the bot is a member of the chat
@@ -127,14 +154,15 @@ async def promote_bot(client: Client, message: Message):
         chat = await client.get_chat(chat_id)
         
         # Get the current bot's privileges
-        privileges = await get_bot_privileges(client, chat.id)
+        privileges = await is_bot_admin(client, chat_id)
         if not privileges:
             await message.reply("I am not an admin or lack permissions in this chat.")
+            logger.warning(f"Bot is not an admin in chat {chat_id} for /promote")
             return
         
         # Promote the bot to admin with the same privileges
         await client.promote_chat_member(
-            chat_id=chat.id,
+            chat_id=chat_id,
             user_id=bot_member.id,
             privileges=ChatPrivileges(**privileges)
         )
@@ -176,8 +204,8 @@ async def promote_bot_all(client: Client, message: Message):
             chat_id = chat["chat_id"]
             chat_title = chat.get("chat_title", str(chat_id))
             try:
-                # Get the current bot's privileges in this chat
-                privileges = await get_bot_privileges(client, chat_id)
+                # Get the current bot's privileges
+                privileges = await is_bot_admin(client, chat_id)
                 if not privileges:
                     failure_count += 1
                     logger.warning(f"Skipping {chat_id}: Bot is not an admin or lacks permissions")
