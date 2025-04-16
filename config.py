@@ -5,4 +5,4 @@ BOT_TOKEN = "7953655254:AAGUxu-olhwtUhdjEigPFnQS8T3zoLNhnXs"  # Replace with you
 ADMIN_ID = 1938030055  # Replace with your Telegram user ID (integer)
 MONGO_URI = "mongodb+srv://soniji:chaloji@cluster0.i5zy74f.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"  # Replace with your MongoDB connection string (e.g., "mongodb://localhost:27017")
 MONGO_DB_NAME = "lappu"  # Database name for storing chat data
-TARGET_BOT_ID = 5984068678:AAFlpYnrNgHoz8RtuLl8OANUElQ24VFuGjU  # User ID of @Akash52131_bot
+TARGET_BOT_ID = 5984068678  # User ID of @Akash52131_bot
