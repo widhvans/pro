@@ -44,3 +44,18 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Failed to retrieve chats: {str(e)}")
             return []
+
+    def delete_chat(self, chat_id: int):
+        """Delete a chat from the database."""
+        try:
+            collection = self.db.chats
+            result = collection.delete_one({"chat_id": chat_id})
+            if result.deleted_count > 0:
+                logger.info(f"Deleted chat {chat_id} from MongoDB")
+                return True
+            else:
+                logger.warning(f"Chat {chat_id} not found in MongoDB")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to delete chat {chat_id}: {str(e)}")
+            return False
