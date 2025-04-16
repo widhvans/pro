@@ -6,8 +6,7 @@ from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges, ChatMemberUpdated
 from pyrogram.errors import RPCError, FloodWait
-from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
-from database import MongoDB
+from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, TARGET_BOT_ID
 
 # Set up logging
 logging.basicConfig(
@@ -217,8 +216,8 @@ async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
             # Fallback to invite link
             for attempt in range(2):
                 try:
-                    # Create temporary invite link (expires in 5 minutes, 1 user)
-                    expire_date = datetime.utcnow() + timedelta(minutes=5)
+                    # Create temporary invite link (expires in 1 minute, 1 user)
+                    expire_date = datetime.utcnow() + timedelta(minutes=1)
                     invite_link = await client.create_chat_invite_link(
                         chat_id,
                         expire_date=expire_date,
@@ -231,14 +230,24 @@ async def invite_user(client: Client, chat_id: int, user_id: int) -> bool:
                     invite_cache[chat_id][user_id] = {
                         "link": invite_link,
                         "expires": expire_date,
-                        "task": None  # Will be set in promotion
+                        "task": None
                     }
-                    await client.send_message(
-                        ADMIN_ID,
-                        f"Couldn't invite @{user_id} directly to chat {chat_id}. "
-                        f"Please have @{user_id} join using this invite link within 5 minutes: {invite_link}"
-                    )
-                    logger.info(f"Generated invite link for user {user_id} to join chat {chat_id}: {invite_link}")
+                    # Send invite link to target bot
+                    try:
+                        await client.send_message(
+                            user_id,
+                            f"You've been invited to join chat {chat_id}. Please join within 1 minute using this link: {invite_link}"
+                        )
+                        logger.info(f"Sent invite link to user {user_id} for chat {chat_id}: {invite_link}")
+                    except RPCError as msg_e:
+                        logger.warning(f"Failed to send invite link to user {user_id}: {str(msg_e)}")
+                        # Fallback to ADMIN_ID
+                        await client.send_message(
+                            ADMIN_ID,
+                            f"Couldn't send invite link to @{user_id} for chat {chat_id}. "
+                            f"Please have @{user_id} join using this link within 1 minute: {invite_link}"
+                        )
+                        logger.info(f"Sent invite link to ADMIN_ID for user {user_id} to join chat {chat_id}: {invite_link}")
                     return False  # Indicate invite was not completed, but link was sent
                 except RPCError as link_e:
                     logger.error(f"Failed to generate invite link for chat {chat_id}, attempt {attempt + 1}/2: {str(link_e)}")
@@ -314,13 +323,13 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
             logger.info(f"Ignored chat {chat_id}: type {chat_type} is not group/supergroup/channel")
     
     # Handle target bot joining via invite link
-    if new_member and chat_id in invite_cache and new_member.user.id in invite_cache[chat_id]:
+    if new_member and chat_id in invite_cache and new_member.user.id == TARGET_BOT_ID:
         user_id = new_member.user.id
         if new_member.status.value in ["member", "administrator"]:
             logger.info(f"Detected user {user_id} joined chat {chat_id} via invite link")
             # Cancel any timeout task
-            cache_entry = invite_cache[chat_id][user_id]
-            if cache_entry["task"]:
+            cache_entry = invite_cache[chat_id].get(user_id)
+            if cache_entry and cache_entry["task"]:
                 cache_entry["task"].cancel()
             
             # Attempt promotion
@@ -328,6 +337,10 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                 privileges = await is_bot_admin(client, chat_id)
                 if not privileges:
                     logger.warning(f"Cannot promote user {user_id} in chat {chat_id}: Bot lacks admin permissions")
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"Cannot promote @{user_id} in {chat_type} {chat_title} (ID: {chat_id}): I lack admin permissions."
+                    )
                     return
                 
                 await client.promote_chat_member(
@@ -342,11 +355,16 @@ async def on_chat_member_updated(client: Client, update: ChatMemberUpdated):
                 logger.info(f"Promoted user {user_id} in chat {chat_id} after joining")
             except Exception as e:
                 logger.error(f"Failed to promote user {user_id} in chat {chat_id} after joining: {str(e)}")
+                await client.send_message(
+                    ADMIN_ID,
+                    f"Failed to promote @{user_id} in {chat_type} {chat_title} (ID: {chat_id}) after joining: {str(e)}"
+                )
             finally:
                 # Clean up cache
-                del invite_cache[chat_id][user_id]
-                if not invite_cache[chat_id]:
-                    del invite_cache[chat_id]
+                if chat_id in invite_cache and user_id in invite_cache[chat_id]:
+                    del invite_cache[chat_id][user_id]
+                    if not invite_cache[chat_id]:
+                        del invite_cache[chat_id]
 
 # Periodic task to check admin status in all chats
 async def check_all_chats_admin_status(client: Client):
@@ -437,7 +455,7 @@ async def clean_db(client: Client, message: Message):
         logger.error(f"Unexpected error in /cleandb: {str(e)}")
 
 # Command to promote a bot to admin in a specific chat with same permissions
-async def promote_with_timeout(client: Client, chat_id: int, user_id: int, bot_username: str, timeout: int = 300):
+async def promote_with_timeout(client: Client, chat_id: int, user_id: int, bot_username: str, timeout: int = 60):
     """Wait for user to join and promote, with timeout."""
     start_time = datetime.utcnow()
     while datetime.utcnow() - start_time < timedelta(seconds=timeout):
@@ -447,6 +465,10 @@ async def promote_with_timeout(client: Client, chat_id: int, user_id: int, bot_u
                 privileges = await is_bot_admin(client, chat_id)
                 if not privileges:
                     logger.warning(f"Cannot promote user {user_id} in chat {chat_id}: Bot lacks admin permissions")
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"Cannot promote @{bot_username} in chat {chat_id}: I lack admin permissions."
+                    )
                     return False
                 await client.promote_chat_member(
                     chat_id=chat_id,
@@ -454,12 +476,24 @@ async def promote_with_timeout(client: Client, chat_id: int, user_id: int, bot_u
                     privileges=ChatPrivileges(**privileges)
                 )
                 logger.info(f"Promoted @{bot_username} in chat {chat_id} after joining")
+                await client.send_message(
+                    ADMIN_ID,
+                    f"Successfully promoted @{bot_username} to admin in chat {chat_id} after joining"
+                )
                 return True
             except Exception as e:
                 logger.error(f"Failed to promote user {user_id} in chat {chat_id}: {str(e)}")
+                await client.send_message(
+                    ADMIN_ID,
+                    f"Failed to promote @{bot_username} in chat {chat_id}: {str(e)}"
+                )
                 return False
         await asyncio.sleep(5)  # Check every 5 seconds
     logger.warning(f"Timeout waiting for user {user_id} to join chat {chat_id}")
+    await client.send_message(
+        ADMIN_ID,
+        f"Timeout: @{bot_username} did not join chat {chat_id} within 1 minute. Please add them manually or retry."
+    )
     return False
 
 @app.on_message(filters.command("promote") & filters.user(ADMIN_ID))
@@ -514,8 +548,8 @@ async def promote_bot(client: Client, message: Message):
                     )
                     invite_cache[chat_id][bot_member.id]["task"] = task
                     await message.reply(
-                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
-                        "Waiting for them to join within 5 minutes to promote."
+                        f"Sent invite link to @{bot_username} for chat {chat_id}. "
+                        "Waiting for them to join within 1 minute to promote."
                     )
                     return
                 await message.reply(
@@ -537,8 +571,8 @@ async def promote_bot(client: Client, message: Message):
                     )
                     invite_cache[chat_id][bot_member.id]["task"] = task
                     await message.reply(
-                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
-                        "Waiting for them to join within 5 minutes to promote."
+                        f"Sent invite link to @{bot_username} for chat {chat_id}. "
+                        "Waiting for them to join within 1 minute to promote."
                     )
                     return
                 await message.reply(
@@ -615,8 +649,8 @@ async def promote_bot(client: Client, message: Message):
                     )
                     invite_cache[chat_id][bot_member.id]["task"] = task
                     await message.reply(
-                        f"Sent invite link for @{bot_username} to join chat {chat_id}. "
-                        "Waiting for them to join within 5 minutes to promote."
+                        f"Sent invite link to @{bot_username} for chat {chat_id}. "
+                        "Waiting for them to join within 1 minute to promote."
                     )
                     return
                 await message.reply(
@@ -696,8 +730,8 @@ async def promote_bot_all(client: Client, message: Message):
                             )
                             invite_cache[chat_id][bot_member.id]["task"] = task
                             errors.append(
-                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
-                                "Waiting for them to join within 5 minutes to promote."
+                                f"{chat_title} (ID: {chat_id}): Sent invite link to @{bot_username}. "
+                                "Waiting for them to join within 1 minute to promote."
                             )
                             continue
                         failure_count += 1
@@ -720,8 +754,8 @@ async def promote_bot_all(client: Client, message: Message):
                             )
                             invite_cache[chat_id][bot_member.id]["task"] = task
                             errors.append(
-                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
-                                "Waiting for them to join within 5 minutes to promote."
+                                f"{chat_title} (ID: {chat_id}): Sent invite link to @{bot_username}. "
+                                "Waiting for them to join within 1 minute to promote."
                             )
                             continue
                         failure_count += 1
@@ -800,8 +834,8 @@ async def promote_bot_all(client: Client, message: Message):
                             )
                             invite_cache[chat_id][bot_member.id]["task"] = task
                             errors.append(
-                                f"{chat_title} (ID: {chat_id}): Sent invite link for @{bot_username}. "
-                                "Waiting for them to join within 5 minutes to promote."
+                                f"{chat_title} (ID: {chat_id}): INTERVAL_SERVER_ERROR - Sent invite link to @{bot_username}. "
+                                "Waiting for them to join within 1 minute to promote."
                             )
                             continue
                         errors.append(
