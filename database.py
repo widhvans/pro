@@ -28,7 +28,7 @@ class MongoDB:
                 {"$set": {"chat_type": chat_type, "chat_title": chat_title}},
                 upsert=True
             )
-            logger.info(f"Saved chat {chat_id} ({chat_title}) to MongoDB")
+            logger.info(f"Saved chat {chat_id} ({chat_title}, type: {chat_type}) to MongoDB")
             return True
         except Exception as e:
             logger.error(f"Failed to save chat {chat_id}: {str(e)}")
