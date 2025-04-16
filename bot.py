@@ -6,6 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, ChatPrivileges, ChatMemberUpdated
 from pyrogram.errors import RPCError, FloodWait
 from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
+from database import MongoDB
 
 # Set up logging
 logging.basicConfig(
